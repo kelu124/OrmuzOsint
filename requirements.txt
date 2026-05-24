@@ -1,9 +1,10 @@
-streamlit>=1.30
-websockets>=12.0
-pydeck>=0.9
-pandas>=2.0
+# Download
 requests>=2.31
-Pillow>=10.0
 python-dotenv>=1.0
+tqdm>=4.65
+
+# Visualisation
+numpy>=1.24
+tifffile>=2024.1
+imagecodecs>=2024.1   # codecs (ZSTD, LZW, …) used by Sentinel Hub TIFF output
 Pillow>=10.0
-requests>=2.31

@@ -1,19 +1,24 @@
-# Secrets
+# Credentials
 .env
-.venv
 
-# Local cache (imagery, quicklooks, catalog responses)
-cache/
+# Downloaded data (can be many GB)
+data/
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
 
-# IDE
+# Editor / OS
 .vscode/
 .idea/
-
-# OS
 .DS_Store
 Thumbs.db
+*.swp
+
+cache
