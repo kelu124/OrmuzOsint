@@ -1,0 +1,19 @@
+# Secrets
+.env
+.venv
+
+# Local cache (imagery, quicklooks, catalog responses)
+cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
