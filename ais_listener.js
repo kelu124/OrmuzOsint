@@ -131,9 +131,11 @@ async function connect() {
           ws.send(subscription);
         });
 
-        ws.addEventListener('message', (event) => {
+        ws.addEventListener('message', async (event) => {
+          // Node.js 22 built-in WebSocket delivers data as Blob, not string
+          const text = typeof event.data === 'string' ? event.data : await event.data.text();
           let raw;
-          try { raw = JSON.parse(event.data); } catch { return; }
+          try { raw = JSON.parse(text); } catch { return; }
           if (raw.error) {
             console.error('[aisstream] server error:', raw.error);
             ws.close();
