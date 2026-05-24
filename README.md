@@ -56,18 +56,21 @@ The default AOI is the Strait of Hormuz, but every script accepts `--bbox` so yo
                          │   Replay files           │
                          └────────────┬─────────────┘
                                       │
-                         ┌────────────▼─────────────┐
-                         │     ais_listener.py      │
-                         │  • Multi-source async    │
-                         │  • Bbox filter           │
-                         │  • Hourly JSONL output   │
-                         └────────────┬─────────────┘
-                                      │
                                       ▼
-                              ais_data/YYYY-MM-DD/HH.jsonl
+                ┌─────────────────────┴───────────────────────┐
+                │                                             │
+   ┌────────────▼─────────────┐                ┌──────────────▼───────────┐
+   │        ais2.py           │                │     ais_listener.py      │
+   │  • aisstream only        │                │  • Multi-source async    │
+   │  • Streams text/JSONL    │                │  • Bbox filter           │
+   │  • Static-data enriched  │                │  • Hourly JSONL output   │
+   └────────────┬─────────────┘                └──────────────┬───────────┘
+                │                                             │
+                ▼                                             ▼
+       stdout / your-file.jsonl                    ais_data/YYYY-MM-DD/HH.jsonl
 ```
 
-The two halves run independently and produce timestamped artifacts that can be cross-referenced offline: for every SAR scene's acquisition window, query the corresponding AIS hour file and compare positions.
+The two halves run independently and produce timestamped artifacts that can be cross-referenced offline: for every SAR scene's acquisition window, query the corresponding AIS data and compare positions.
 
 ---
 
@@ -77,7 +80,8 @@ The two halves run independently and produce timestamped artifacts that can be c
 .
 ├── download_sar.py        # Sentinel-1 downloader (SAFE + clipped preview)
 ├── visualisation.py       # False-color renderer with native-res tiling
-├── ais_listener.py        # Multi-source AIS collector
+├── ais2.py                # Minimal AIS streamer (text/JSONL to stdout)
+├── ais_listener.py        # Multi-source AIS collector (background daemon)
 ├── .env.example           # Credentials template
 ├── requirements.txt       # pip dependencies
 ├── README.md              # this file
@@ -112,7 +116,10 @@ python download_sar.py --days 7
 python visualisation.py --list
 python visualisation.py <ID>          # use the ID printed by --list
 
-# 5. In another terminal, start collecting AIS in parallel
+# 5a. Quick look: stream AIS to your terminal in real time
+python ais2.py --bbox 54.5 25.0 57.5 27.5
+
+# 5b. Or run a long-running collector that writes hourly JSONL files
 python ais_listener.py --bbox 54.5 25.0 57.5 27.5
 ```
 
@@ -281,6 +288,105 @@ You can compute γ⁰ from σ⁰ by dividing by `cos(incidence_angle)`. For Sent
 
 ---
 
+## AIS collection: two tools, pick what fits
+
+There are two ways to bring AIS into the pipeline, and which one you reach for depends on how much ceremony you want.
+
+| | `ais2.py` | `ais_listener.py` |
+|---|---|---|
+| Mental model | Watch the firehose | Run a daemon |
+| Output | stdout (text or JSONL) — pipe it, tee it, redirect it | Hourly JSONL files in `ais_data/YYYY-MM-DD/HH.jsonl` |
+| Sources | aisstream.io only | aisstream.io + NMEA-TCP + replay (extensible) |
+| Static-data enrichment | ✅ name, type, destination, dimensions inlined into every position | ❌ raw payloads only |
+| Per-vessel throttle | ✅ configurable (`--throttle SEC`) | ❌ writes every message in-bbox |
+| Reconnect on failure | ✅ | ✅ |
+| Best for | Interactive monitoring, quick captures, debugging, ad-hoc filtering with `jq` | Multi-day unattended collection, fusion with SAR scenes, multi-receiver setups |
+| Dependencies | `websockets`, `python-dotenv` | + `pyais` (if using NMEA-TCP) |
+
+If you don't know which to use, start with `ais2.py`. It's faster to understand, leaves no files behind unless you redirect, and gives you nicely enriched per-vessel records straight to your terminal. Move to `ais_listener.py` when you need durable archiving, multiple receivers, or you want the pipeline to survive your laptop closing.
+
+---
+
+## `ais2.py` — minimal text streamer
+
+One source (aisstream.io), one output (stdout). Streams enriched AIS position records as they arrive, throttled to one line per vessel per N seconds so the terminal stays readable.
+
+**The trick that makes it useful:** it subscribes to both `PositionReport` and `ShipStaticData` and keeps a per-MMSI cache of static info in memory. The first time a ship's static data arrives, the cache is populated; every position from that ship afterward is emitted with name, type, destination, length, width, and draught attached. You get the enrichment of a tracking platform without running a database.
+
+### Output formats
+
+Human-readable (default):
+
+```
+16:08:09  MMSI 211223344  EXAMPLE TANKER        ( 26.0421,   55.5023)  sog= 12.3kn  cog= 87.0°  → DUBAI
+16:08:14  MMSI 538001122  ALSHAMS               ( 26.1108,   55.4901)  sog=  9.8kn  cog=265.0°  → JEBEL ALI
+```
+
+JSONL (`--jsonl`) — one record per line, ready for `jq` / pandas / DuckDB:
+
+```json
+{"mmsi": 211223344, "time_utc": "2026-05-24T16:08:09", "received_at": "2026-05-24T16:08:09+00:00", "lat": 26.0421, "lon": 55.5023, "sog": 12.3, "cog": 87.0, "heading": 88, "ship_name": "EXAMPLE TANKER", "ship_type": 80, "destination": "DUBAI", "draught": 11.5, "length": 200, "width": 32}
+```
+
+Logs (connection status, errors, reconnects) go to **stderr**, so stdout stays a clean data stream that survives pipes and redirects.
+
+### Usage
+
+```bash
+# Default Hormuz bbox, human-readable to terminal
+python ais2.py
+
+# Wider Persian Gulf + Gulf of Oman — much better coverage in practice
+python ais2.py --bbox 48.0 22.0 60.0 30.5
+
+# Capture to a JSONL file while still watching it live in the terminal
+python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl 2> stream.err | tee stream.jsonl
+
+# Same thing detached from the terminal (survives logout)
+nohup python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl 2> stream.err | tee stream.jsonl &
+disown
+
+# No throttle — every position aisstream sends (very chatty)
+python ais2.py --throttle 0
+
+# 5-minute throttle — quieter, still useful for slow-moving vessels
+python ais2.py --bbox 48.0 22.0 60.0 30.5 --throttle 300
+
+# Live filter to just Hormuz transit with jq while watching the whole Gulf
+python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl \
+    | jq -c 'select(.lon >= 54.5 and .lon <= 57.5 and .lat >= 25.0 and .lat <= 27.5)'
+
+# Also surface static-data updates (useful for catching new ships entering the AOI)
+python ais2.py --include-static
+```
+
+### Full flag reference
+
+| Flag | Description |
+|---|---|
+| `--bbox W S E N` | Four floats (lon/lat). Default: Hormuz `54.5 25.0 57.5 27.5`. |
+| `--throttle SEC` | Per-MMSI minimum interval between emitted positions (default 120). `0` = no throttle. |
+| `--jsonl` | Emit one JSON record per line instead of human-readable text. |
+| `--include-static` | Also print a line whenever ShipStaticData arrives. |
+| `-v` / `--verbose` | DEBUG-level logging on stderr. |
+
+### When traffic looks sparse
+
+The terrestrial network behind aisstream.io has uneven coverage. The **mid-strait Hormuz bbox** specifically tends to be quiet because there are few volunteer receivers with line-of-sight to the middle of the strait. If you see no records after a minute or two:
+
+```bash
+# Sanity-check the connection works at all
+python ais2.py --bbox -180 -90 180 90    # global firehose — instant traffic
+
+# Use a wider Gulf bbox instead — gives you coverage from Dubai, Bandar Abbas,
+# Muscat, Fujairah, Doha, Kuwait coastal receivers
+python ais2.py --bbox 48.0 22.0 60.0 30.5
+```
+
+The wider Gulf bbox is what works in practice for OSINT-style monitoring of Hormuz traffic — you see tankers approaching the strait from either side hours before they enter it, which is often more analytically interesting than the strait itself.
+
+---
+
 ## `ais_listener.py` — multi-source AIS collector
 
 Subscribes to one or more AIS data sources concurrently, filters every message by the bounding box, and persists matches to hourly JSONL files for later fusion with SAR.
@@ -384,7 +490,11 @@ The whole point of the toolkit is correlating SAR detections with AIS positions.
 
 ```bash
 # Terminal 1: collect AIS continuously over the AOI
+# (Option A — long-running daemon writing hourly files for later analysis)
 python ais_listener.py --bbox 54.5 25.0 57.5 27.5
+
+# (Option B — lightweight, capture to one file while watching live)
+python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl 2> stream.err | tee stream.jsonl
 
 # Terminal 2: every few days, pull new SAR scenes and render them
 python download_sar.py --days 7
@@ -392,7 +502,7 @@ python visualisation.py --list
 python visualisation.py <ID>
 ```
 
-For each rendered scene, look up the acquisition timestamp in `data/safe/<scene>.json` (`ContentDate.Start`) and pull AIS records from the matching `ais_data/YYYY-MM-DD/HH.jsonl` files within ±5 minutes. Project AIS lat/lon onto the JPG using the tile manifest's pixel ranges, and:
+For each rendered scene, look up the acquisition timestamp in `data/safe/<scene>.json` (`ContentDate.Start`) and pull AIS records from the matching JSONL — either `ais_data/YYYY-MM-DD/HH.jsonl` (from `ais_listener.py`) or your captured `stream.jsonl` (from `ais2.py`) — within ±5 minutes. Project AIS lat/lon onto the JPG using the tile manifest's pixel ranges, and:
 
 - **SAR detection with matching AIS** → identified ship (you can pull MMSI, name, type)
 - **SAR detection without matching AIS** → dark vessel, worth investigating
@@ -421,10 +531,10 @@ python-dotenv
 tqdm
 numpy
 tifffile
-imagecodecs        # ZSTD decode for Sentinel Hub TIFFs
+imagecodecs        # ZSTD decode for Sentinel Hub TIFFs (visualisation.py)
 Pillow
-websockets
-pyais              # only needed if you use --sources nmea-tcp
+websockets         # ais2.py and ais_listener.py
+pyais              # only for ais_listener.py with --sources nmea-tcp
 ```
 
 A `requirements.txt` is included.
