@@ -1,517 +1,454 @@
-# OrmuzOsint — Sentinel-1 SAR Toolkit for Ship Spotting
+# Hormuz Ship Tracker
 
-Open-source toolkit for downloading and rendering [Sentinel-1](https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-1)
-synthetic-aperture radar imagery over the **Strait of Hormuz** (or any other
-bounding box). Two small Python scripts:
+Open-source toolkit for **fusing Sentinel-1 SAR imagery with live AIS data** over the Strait of Hormuz (or any other maritime AOI). Built for OSINT-style analysis: detect every ship the radar sees, cross-reference with what's broadcasting AIS, and surface the gap — the "dark" vessels.
 
-1. **`download_sar.py`** — pulls recent Sentinel-1 IW GRD (VV+VH) scenes from
-   the Copernicus Data Space Ecosystem, plus a clipped GeoTIFF preview from
-   the Sentinel Hub Process API.
-2. **`visualisation.py`** — renders that data into false-colour JPGs you can
-   browse for ships, ideally at native ~10 m resolution via automatic tiling.
-
-Built with free public APIs only. MIT-licensed.
-
-> **Why SAR over Hormuz?** Roughly 20% of global oil flows through this
-> strait. SAR works through cloud and at night — and Sentinel-1 is the only
-> open, free, near-real-time SAR mission. It's the workhorse of maritime
-> OSINT.
+All data sources are free. No paid satellite imagery, no commercial AIS subscriptions, no GIS suite required.
 
 ---
 
-## Table of contents
+## Why this exists
 
-- [What this does](#what-this-does)
-- [What this does *not* do](#what-this-does-not-do)
-- [Quickstart](#quickstart)
-- [Setup](#setup)
-- [Usage: `download_sar.py`](#usage-download_sarpy)
-- [Usage: `visualisation.py`](#usage-visualisationpy)
-- [How it works](#how-it-works)
-- [Output layout](#output-layout)
-- [Resource considerations](#resource-considerations)
-- [Limitations and caveats](#limitations-and-caveats)
-- [Where to go next](#where-to-go-next)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
-- [Acknowledgments](#acknowledgments)
+Synthetic Aperture Radar (SAR) sees ships day or night, through clouds and haze. AIS tells you who's *claiming* to be where. The interesting boats are the ones SAR sees but AIS doesn't — IRGC fast craft running dark, sanctioned tankers spoofing positions, fishing boats with disabled transponders.
+
+This project gives you the three pieces you need:
+
+1. **Download** the latest Sentinel-1 SAR scenes over a bounding box
+2. **Visualize** them as high-resolution false-color images where ships pop visually
+3. **Collect** AIS broadcasts in the same area in parallel, ready to overlay
+
+The default AOI is the Strait of Hormuz, but every script accepts `--bbox` so you can point it anywhere — Singapore Strait, Bab-el-Mandeb, the Bosphorus, the English Channel, your local marina.
 
 ---
 
-## What this does
+## The pipeline
 
-- **Discover** all Sentinel-1 IW GRD scenes (Interferometric Wide swath,
-  Ground Range Detected, dual-pol VV+VH) intersecting an area of interest
-  within a date window.
-- **Download** the full SAFE products (~1 GB each, calibration-ready) from
-  Copernicus.
-- **Render** clipped, lightweight previews server-side via Sentinel Hub.
-- **Visualise** scenes locally as false-colour JPGs, with a recipe tuned for
-  ship detection on water (R = VV, G = VH, B = VH/VV ratio).
-- **Tile** native-resolution renders so any image, however large, fits in
-  digestible per-tile JPGs with a manifest.
-- **Filter** the catalog so you only see scenes whose footprint fully covers
-  your AOI.
+```
+                         ┌──────────────────────────┐
+                         │  Copernicus Data Space   │  Sentinel-1 IW GRDH
+                         │  + Sentinel Hub          │  (free, ~3 days revisit)
+                         └────────────┬─────────────┘
+                                      │
+                         ┌────────────▼─────────────┐
+                         │     download_sar.py      │
+                         │  • OData catalog query   │
+                         │  • Full SAFE .zip + clip │
+                         │  • Bbox-coverage filter  │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                              data/safe/*.SAFE.zip
+                              data/previews/*.SAFE.tif
+                                      │
+                         ┌────────────▼─────────────┐
+                         │    visualisation.py      │
+                         │  • σ⁰ calibration        │
+                         │  • False-color RGB       │
+                         │  • Native-res tiling     │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                              data/safe/*_falsecolor*.jpg
+                              data/safe/*_tiles.json
 
-Caching is implicit: re-running over overlapping date ranges or re-rendering
-the same scene is idempotent — already-downloaded products are skipped.
+                         ┌──────────────────────────┐
+                         │   aisstream.io WebSocket │  Live AIS
+                         │   NMEA receivers         │  (free, real-time)
+                         │   Replay files           │
+                         └────────────┬─────────────┘
+                                      │
+                         ┌────────────▼─────────────┐
+                         │     ais_listener.py      │
+                         │  • Multi-source async    │
+                         │  • Bbox filter           │
+                         │  • Hourly JSONL output   │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                              ais_data/YYYY-MM-DD/HH.jsonl
+```
 
-## What this does *not* do
-
-- No automated ship detection (CFAR, deep learning, etc.). The render gives
-  you visually obvious bright targets; turning that into a vessel list is a
-  separate step.
-- No AIS correlation, transponder spoofing checks, or "dark vessel" flagging.
-- No georeferencing of the output JPGs into a GIS. The preview GeoTIFFs are
-  georeferenced; the rendered JPGs from the full SAFE are in image
-  coordinates only.
-- No SLC processing (interferometry, polarimetric decomposition). GRD only.
+The two halves run independently and produce timestamped artifacts that can be cross-referenced offline: for every SAR scene's acquisition window, query the corresponding AIS hour file and compare positions.
 
 ---
 
-## Quickstart
+## Repository layout
+
+```
+.
+├── download_sar.py        # Sentinel-1 downloader (SAFE + clipped preview)
+├── visualisation.py       # False-color renderer with native-res tiling
+├── ais_listener.py        # Multi-source AIS collector
+├── .env.example           # Credentials template
+├── requirements.txt       # pip dependencies
+├── README.md              # this file
+├── LICENSE                # MIT
+├── data/                  # SAR outputs (created on first run)
+│   ├── safe/              # Full SAFE products + rendered JPGs
+│   └── previews/          # Clipped 3-band GeoTIFF previews
+└── ais_data/              # AIS captures (created on first run)
+    └── YYYY-MM-DD/
+        └── HH.jsonl       # One line per AIS message
+```
+
+---
+
+## Quick start
 
 ```bash
-git clone https://github.com/<your-account>/OrmuzOsint.git
-cd OrmuzOsint
+# 1. Clone and set up
+git clone https://github.com/YOUR-USERNAME/hormuz-ship-tracker.git
+cd hormuz-ship-tracker
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
+# 2. Fill in your free API keys
 cp .env.example .env
-# Edit .env: fill in CDSE_USER, CDSE_PASSWORD, SH_CLIENT_ID, SH_CLIENT_SECRET
+# edit .env — see "Credentials" section below
 
-# Pull the last 2 weeks of scenes intersecting the default Hormuz bbox
-python download_sar.py --days 14
+# 3. Pull last week's SAR data over Hormuz
+python download_sar.py --days 7
 
-# See what's downloaded
+# 4. List what you've got, render the most recent scene
 python visualisation.py --list
+python visualisation.py <ID>          # use the ID printed by --list
 
-# Render a scene (use the 8-char ID from --list, or a unique prefix)
-python visualisation.py <ID>
+# 5. In another terminal, start collecting AIS in parallel
+python ais_listener.py --bbox 54.5 25.0 57.5 27.5
 ```
 
-That's it. You'll get JPGs under `data/safe/` (native ~10 m, tiled if the
-scene exceeds 8000 px) and `data/previews/` (clipped to the bbox, lower
-resolution but instantly viewable).
+You now have rendered SAR JPGs in `data/safe/` and a growing archive of AIS positions in `ais_data/`. The next section explains each tool in detail.
 
 ---
 
-## Setup
+## Credentials
 
-### Prerequisites
-
-- **Python 3.10+** (uses `tuple[...]` PEP 604 typing).
-- **A few gigabytes of disk** — each full SAFE product is ~1 GB.
-- **About 3 GB of RAM** for native-resolution rendering of a full IW GRDH
-  scene.
-
-### Accounts
-
-All free:
-
-| Service | What it gives you | Sign up |
-|---|---|---|
-| Copernicus Data Space Ecosystem (CDSE) | OData catalog + product downloads | <https://dataspace.copernicus.eu> |
-| Sentinel Hub OAuth client (on CDSE) | Process API for clipped previews | CDSE Dashboard → User Settings → OAuth Clients |
-| aisstream.io *(optional, future AIS work)* | Live terrestrial AIS WebSocket | <https://aisstream.io> |
-
-### `.env` file
-
-Copy `.env.example` to `.env` and fill in the four CDSE/Sentinel Hub fields.
-Both scripts read it automatically via `python-dotenv`.
+All three services are free. Sign up, copy the keys into `.env`:
 
 ```dotenv
-CDSE_USER=you@example.com
-CDSE_PASSWORD=...
-SH_CLIENT_ID=...
-SH_CLIENT_SECRET=...
+# AIS (https://aisstream.io — sign in with GitHub)
+AISSTREAM_API_KEY=
+
+# Copernicus Data Space (https://dataspace.copernicus.eu — free account)
+CDSE_USER=
+CDSE_PASSWORD=
+
+# Sentinel Hub OAuth client
+# CDSE Dashboard → User Settings → OAuth Clients → Create
+SH_CLIENT_ID=
+SH_CLIENT_SECRET=
 ```
 
-`.env` is gitignored by default — never commit it.
+| Service | Used for | Tier | Notes |
+|---|---|---|---|
+| aisstream.io | Live AIS WebSocket | Free, no quota | GitHub sign-in, instant API key |
+| CDSE (OData) | Full Sentinel-1 SAFE products | Free, generous | Account approval is automatic |
+| Sentinel Hub (CDSE) | Clipped GeoTIFF previews | Free tier: 30k processing units/month | More than enough for one bbox |
 
-### Installation
-
-```bash
-pip install -r requirements.txt
-```
-
-This pulls in:
-
-- `requests`, `python-dotenv`, `tqdm` — downloads
-- `numpy`, `tifffile`, `imagecodecs`, `Pillow` — visualisation
-
-`imagecodecs` is mandatory: the Sentinel Hub Process API returns ZSTD-
-compressed TIFFs and `tifffile` needs `imagecodecs` to decode them.
+The Sentinel Hub OAuth client is separate from your CDSE login. Go to the [CDSE Dashboard](https://shapps.dataspace.copernicus.eu/dashboard/), open **User Settings → OAuth Clients**, click **Create**, and paste the client ID and secret into `.env`.
 
 ---
 
-## Usage: `download_sar.py`
+## `download_sar.py` — Sentinel-1 downloader
 
-Queries the CDSE OData catalog for Sentinel-1 IW GRDH dual-polarisation
-(VV+VH) scenes, then for each one:
+Queries the CDSE OData catalog for `S1*_IW_GRDH_1SDV_*` scenes (IW mode, GRD high-res, dual-polarization VV+VH) that intersect a bounding box in a given time window. For each match, downloads two things:
 
-1. Downloads the full `.SAFE.zip` from CDSE.
-2. Renders a clipped GeoTIFF preview (3 bands: VV, VH, VV/VH ratio; σ⁰
-   linear power, float32) via the Sentinel Hub Process API.
+- **Full SAFE product** (`data/safe/<scene>.zip`, ~1 GB) — the complete Sentinel-1 product with both polarizations, calibration LUTs, and metadata. This is what real ship-detection pipelines need.
+- **Clipped GeoTIFF preview** (`data/previews/<scene>.tif`, ~30–100 MB) — Sentinel Hub Process API renders just your bbox as a 3-band FLOAT32 raster: σ⁰ VV, σ⁰ VH, VV/VH ratio. Orthorectified, ready to view.
 
-Both outputs are cached by filename, so re-runs only fetch what's missing.
+Both are cached: re-running over overlapping date windows skips files that already exist. A `<scene>.json` sidecar next to each output holds the catalog metadata (footprint, acquisition times, orbit) for downstream tooling.
 
-### Flags
-
-```text
---start YYYY-MM-DD       Start date (UTC, inclusive)
---days N                 Convenience: last N days (mutually exclusive with --start)
---end YYYY-MM-DD         End date (UTC, exclusive). Defaults to now.
-
---bbox MIN_LON MIN_LAT MAX_LON MAX_LAT
-                         Area of interest. Default: Strait of Hormuz
-                         (54.5, 25.0, 57.5, 27.5).
---full-coverage          Only keep scenes whose footprint fully contains
-                         the bbox (default: any-intersection).
-
---data-dir PATH          Output directory (default: ./data).
---no-safe                Skip full SAFE downloads (previews only).
---no-preview             Skip preview generation (SAFE only).
---list-only              Print matching scenes and exit. No downloads.
--v, --verbose            DEBUG-level logging.
-```
-
-### Examples
+### Usage
 
 ```bash
-# Last 2 weeks over Hormuz, full pipeline
+# Default bbox (Hormuz), last 14 days
 python download_sar.py --days 14
 
-# Specific date range, dry-run first
-python download_sar.py --start 2026-05-01 --end 2026-05-24 --list-only
+# Explicit window
 python download_sar.py --start 2026-05-01 --end 2026-05-24
 
-# A different AOI (e.g. Bab-el-Mandeb)
-python download_sar.py --days 14 --bbox 42.5 12.0 44.0 13.5
+# Custom bbox: Singapore Strait
+python download_sar.py --days 7 --bbox 103.5 1.0 104.5 1.5
 
-# Only scenes that fully cover a small AOI
-python download_sar.py --days 30 \
-    --bbox 55.5 26.0 57.0 27.0 --full-coverage --list-only
+# Only scenes whose footprint *fully contains* the bbox
+python download_sar.py --days 30 --bbox 55.0 25.5 56.5 27.0 --full-coverage
 
-# Light pipeline: only the previews (no 1 GB SAFE downloads)
+# Dry-run: list what's available, download nothing
+python download_sar.py --days 14 --list-only
+
+# Skip the heavy SAFE products, just grab clipped previews
 python download_sar.py --days 14 --no-safe
 ```
 
-### About `--full-coverage`
+### Full flag reference
 
-The CDSE OData spec only reliably supports `OData.CSC.Intersects(area=...)`
-server-side. To find scenes that *fully cover* a bbox, the script does:
+| Flag | Description |
+|---|---|
+| `--start YYYY-MM-DD` | Window start (UTC, inclusive). Mutually exclusive with `--days`. |
+| `--end YYYY-MM-DD` | Window end (UTC, exclusive). Defaults to now. |
+| `--days N` | Convenience: last N days ending now. |
+| `--bbox W S E N` | Four floats (lon/lat). Default: Hormuz `54.5 25.0 57.5 27.5`. |
+| `--full-coverage` | Keep only scenes whose footprint fully contains the bbox. |
+| `--data-dir PATH` | Where to write (default `./data`). |
+| `--no-safe` | Skip full SAFE downloads. |
+| `--no-preview` | Skip Sentinel Hub previews. |
+| `--list-only` | List matches; don't download. |
+| `-v` / `--verbose` | DEBUG-level logging (shows the OData filter). |
 
-1. Query the catalog for any intersection (server-side).
-2. For each result, parse the returned `GeoFootprint` (GeoJSON polygon).
-3. Test that all four bbox corners lie inside the footprint.
+### Notes on bbox coverage
 
-This is exact for the quasi-trapezoidal Sentinel-1 IW footprints (they're
-always convex), and adds zero extra API calls.
+A Sentinel-1 IW swath is ~250 km wide and each scene covers ~150–250 km along-track. The default Hormuz bbox (~300×280 km) is larger than a single scene along-track, so `--full-coverage` against the default bbox will frequently return zero results. The script warns when the filter empties the set. For a "fully covered" workflow, shrink the bbox to ~150 km on the longest axis or rely on multiple intersecting scenes mosaiced downstream.
 
-A single Sentinel-1 IW scene covers ~250 km swath × ~150–250 km along-track.
-If your bbox is larger than that on either axis, **no single scene will
-fully cover it** — the script warns when the filter empties the result set.
-For the Hormuz default bbox (300 × 280 km), `--full-coverage` is generally
-too strict; shrink the AOI to the actual strait (~55.5 26.0 57.0 27.0).
+### Expected scene count
+
+With Sentinel-1A + Sentinel-1C operating, Hormuz sees a Sentinel-1 pass roughly every 3 days when averaging ascending and descending orbits. About half are dual-pol VV+VH. Expect 3–8 matching scenes per 14-day window.
 
 ---
 
-## Usage: `visualisation.py`
+## `visualisation.py` — false-color renderer
 
-Reads the data in `./data/` and renders false-colour JPGs.
+Reads what `download_sar.py` left in `data/`, applies σ⁰ calibration (from the SAFE's calibration LUT), and writes a false-color JPG per scene.
 
-### Flags
+The recipe is the standard ocean-friendly composite:
 
-```text
-ID                       Scene ID (or unique prefix). See --list.
---list                   List scenes in data/ and exit.
---max-dim N              Max pixel dim per tile when rendering from SAFE
-                         (default 8000). Larger = fewer tiles + more RAM;
-                         smaller = more tiles + less RAM.
---prefer {safe,preview}  Which source to use when both exist (default safe).
---bbox MIN_LON MIN_LAT MAX_LON MAX_LAT
-                         Reference area for --full-coverage. Default: Hormuz.
---full-coverage          When listing or selecting, only consider scenes
-                         whose footprint fully contains the bbox (uses the
-                         GeoFootprint cached in the sidecar JSON).
--v, --verbose            DEBUG-level logging.
+| Channel | Source | Stretch |
+|---|---|---|
+| **R** | σ⁰ VV (dB) | −25 to 0 dB |
+| **G** | σ⁰ VH (dB) | −30 to −5 dB |
+| **B** | VH / VV ratio (dB) | −10 to +5 dB |
+
+Open water comes out dark blue (low VV/VH, high VH/VV ratio). Land is olive-yellow. **Ships are bright yellow point targets** — their metal hulls and superstructure scatter strongly in both polarizations.
+
+### Native-resolution tiling
+
+A real Sentinel-1 IW GRDH is ~25,000 × 16,500 pixels. Rather than downsampling to fit one JPG, the script renders at **native ~10 m resolution** and splits into tiles where each tile's largest dimension is ≤ `--max-dim` (default 8000 px). With the default, that's typically a 4 × 3 grid = 12 tiles per scene.
+
+Tiles are saved with position info baked into the filename:
+
+```
+<scene>_falsecolor_r{row}c{col}_y{y0}-{y1}_x{x0}-{x1}.jpg
 ```
 
-### Examples
+Plus a `<scene>_falsecolor_tiles.json` manifest with the full grid layout:
+
+```json
+{
+  "scene": "S1A_IW_GRDH_1SDV_20260520T024545_..._C5BD.SAFE",
+  "full_image": { "width": 25789, "height": 16734 },
+  "grid": { "rows": 3, "cols": 4, "max_dim": 8000 },
+  "tiles": [
+    { "row": 0, "col": 0, "y_range": [0, 5578], "x_range": [0, 6448],
+      "width": 6448, "height": 5578,
+      "file": "S1A_..._falsecolor_r00c00_y000000-005578_x000000-006448.jpg" }
+  ]
+}
+```
+
+If the image fits in a single tile (when `--max-dim` ≥ the largest dimension), output is just `<scene>_falsecolor.jpg` with no manifest. The calibration LUT is sampled at original-image coordinates regardless of tile boundary — tiles seamlessly reconstruct the full image, verified to floating-point precision.
+
+### Usage
 
 ```bash
-# Show every scene
+# List every scene found in data/
 python visualisation.py --list
 
-# Show only scenes that fully cover the strait
-python visualisation.py --list --bbox 55.5 26.0 57.0 27.0 --full-coverage
-
-# Render a scene
+# Render a scene by ID (or unique prefix)
 python visualisation.py 163390df
+python visualisation.py 1633
 
-# Render at lower native resolution (no tiling); fits in one ~5000×3000 JPG
-python visualisation.py 163390df --max-dim 30000
-
-# Force the small preview render (much faster, lower res)
+# Force the medium-res preview path (faster, lower res)
 python visualisation.py 163390df --prefer preview
+
+# Larger tiles = fewer files, more RAM
+python visualisation.py 163390df --max-dim 16000
 ```
 
-### Output filenames
+### Full flag reference
 
-When the scene needs no tiling (one tile covers it):
-
-```text
-<scene_name>_falsecolor.jpg
-```
-
-When tiling is needed, every tile is its own JPG, with position encoded in
-the filename so tiles relate back to the original image:
-
-```text
-<scene>_falsecolor_r{row:02d}c{col:02d}_y{y0:06d}-{y1:06d}_x{x0:06d}-{x1:06d}.jpg
-```
-
-A companion manifest is also written:
-
-```text
-<scene>_falsecolor_tiles.json
-```
-
-It records the full image dimensions, grid shape, `max_dim` used, and the
-filename → pixel-range mapping for every tile.
-
----
-
-## How it works
-
-### The Sentinel-1 IW GRDH product, briefly
-
-Sentinel-1 acquires C-band SAR data in the Interferometric Wide (IW) swath
-mode over most of Earth's land and coastal seas. The Ground Range Detected
-(GRD) High-resolution (H) product is:
-
-- 250 km swath, ~10 m × 10 m pixel spacing
-- Two polarisations: VV (vertical-transmit / vertical-receive) and VH
-  (vertical-transmit / horizontal-receive)
-- Revisit: every ~6 days at the equator with one satellite; the Hormuz
-  area sees a useful pass every 2–4 days with the current Sentinel-1A +
-  Sentinel-1C pair, but only some are dual-pol VV+VH.
-
-The raw measurement is a digital number (DN) per pixel — proportional to,
-but not directly, the radar backscatter. Calibration is required.
-
-### From DN to σ⁰
-
-The standard normalised radar cross-section, σ⁰ (sigma-nought, linear
-power), is computed via the per-scene calibration LUT:
-
-```text
-σ⁰(line, pixel) = DN(line, pixel)² / sigmaNought(line, pixel)²
-```
-
-`sigmaNought` is provided as a sparse 2D grid in
-`annotation/calibration/calibration-*.xml`. The visualisation script
-parses it, bilinearly interpolates it onto every output pixel coordinate,
-and applies the formula. No SNAP, no rasterio, no GDAL — pure NumPy.
-
-A practical note: γ⁰ (gamma-nought) = σ⁰ / cos(θ_incidence) differs from
-σ⁰ by 0.6–1.6 dB across the Sentinel-1 IW incidence range. After a dB
-stretch for visualisation, the difference is invisible. The script uses
-σ⁰ for simplicity; if you need true γ⁰ for quantitative work you'll
-also need to parse `annotation/<pol>.xml` for the incidence angle grid.
-
-### False-colour recipe
-
-```text
-R = VV       stretched   -25..0 dB  →  0..255
-G = VH       stretched   -30..-5 dB →  0..255
-B = VH / VV  stretched   -10..+5 dB →  0..255
-```
-
-What you see on the map:
-
-| Feature | Why |
+| Flag | Description |
 |---|---|
-| **Dark blue / black water** | Calm water reflects radar away from the satellite — low σ⁰ in both polarisations. |
-| **Bright yellow / white points** | Metal ship hulls and superstructures cause strong corner-reflector returns — high VV *and* high VH. |
-| **Olive / khaki land** | Vegetated or built-up land has medium VV and slightly elevated VH. |
-| **Red / orange streaks** | Rough sea or wind streaks — high VV, low VH (ratio is low). |
+| `--list` | List scenes in `data/` and exit. |
+| `--max-dim N` | Max pixel dimension per tile (default 8000). |
+| `--prefer {safe,preview}` | Source preference when both exist (default `safe`). |
+| `-v` / `--verbose` | DEBUG-level logging. |
 
-### Tiling
+### Memory usage
 
-A full IW GRDH scene is ~25,000 × 16,500 px. Rendering monolithically would
-need ~10 GB of RAM and produce an unwieldy JPG. Instead, the visualisation
-script splits the image into a grid where every tile is ≤ `--max-dim` px
-on each axis (default 8000), processes one tile at a time, and writes each
-to its own JPG. The calibration LUT is sampled at original-image coordinates
-for every tile so seams are pixel-accurate.
+Peak RAM is roughly 1.5 GB per tile during processing, plus the full DN arrays held in memory (~1.6 GB for a typical IW GRDH). About 3 GB total at default settings. Bump `--max-dim 16000` for higher-res tiles (4 instead of 12 for the same scene) at ~6 GB peak.
 
-Default Hormuz scene → 4 × 3 = 12 tiles, ~5 MB each, ~3 GB peak RAM.
+### Why σ⁰ and not γ⁰?
+
+You can compute γ⁰ from σ⁰ by dividing by `cos(incidence_angle)`. For Sentinel-1 IW (θ ≈ 30°–46°), this is a 0.6–1.6 dB difference — visually identical after the dB stretch the script applies. The incidence angle is in the SAFE under `annotation/s1a-iw-grd-*.xml` if you ever need true γ⁰ for quantitative work.
 
 ---
 
-## Output layout
+## `ais_listener.py` — multi-source AIS collector
 
-After running both scripts:
+Subscribes to one or more AIS data sources concurrently, filters every message by the bounding box, and persists matches to hourly JSONL files for later fusion with SAR.
+
+### Sources
+
+| Source | Free? | What it is |
+|---|---|---|
+| `aisstream` | ✅ | aisstream.io's global WebSocket. Server-side bbox filtering; the script's local check is the safety net. |
+| `nmea-tcp` | ✅ | Connect to any NMEA 0183 AIS receiver over TCP (your own RTL-SDR + AIS-Catcher, a dAISy hardware dongle, a friend's gateway in the Gulf, a public feed). Decodes AIVDM/AIVDO sentences including multi-fragment messages. Requires `pip install pyais`. |
+| `replay` | ✅ | Replay an existing JSONL capture through the same pipeline. Useful for testing without burning aisstream quota, re-processing historical data with a different bbox, or sharing reproducible test cases. |
+
+Honest note on alternatives: **aisstream.io is the only truly-free real-time global stream available out of the box.** AISHub.net requires you to contribute your own AIS receiver feed to access theirs. National sources (Norway's Kystverket, Denmark's DMA) only cover their own waters. Commercial satellite AIS (Spire, Kpler, exactEarth) is the gold standard for blue water — and isn't free. For Hormuz specifically, that means mid-strait coverage is the main known gap of any free workflow.
+
+### Architecture
+
+One asyncio event loop. Each source is a `Source` subclass running as a concurrent task and pushing canonical records into a shared queue. A writer task drains the queue into hourly JSONL files. A stats task logs throughput periodically. All sources auto-reconnect with exponential backoff (1s → 60s cap). SIGINT and SIGTERM trigger graceful shutdown: drain the queue, close the current file, log final stats.
+
+### Canonical record schema
+
+Every message ends up in the same shape regardless of source:
+
+```json
+{
+  "source": "aisstream",
+  "received_at": "2026-05-24T16:08:09.123+00:00",
+  "type": "PositionReport",
+  "mmsi": 211223344,
+  "lat": 26.0,
+  "lon": 55.5,
+  "ship_name": "EXAMPLE TANKER",
+  "time_utc": "2026-05-24 16:08:08.412345 +0000 UTC",
+  "raw": { }
+}
+```
+
+The `raw` field preserves the source payload so you don't lose anything if you later want a field the canonical schema didn't promote.
+
+### Output layout
+
+```
+ais_data/
+├── 2026-05-24/
+│   ├── 14.jsonl
+│   ├── 15.jsonl
+│   └── 16.jsonl
+└── 2026-05-25/
+    ├── 00.jsonl
+    └── ...
+```
+
+One file per UTC hour, append-only, line-flushed — safe to `tail -f` or rsync to another machine while running.
+
+### Usage
+
+```bash
+# Default (aisstream alone) over Hormuz
+python ais_listener.py --bbox 54.5 25.0 57.5 27.5
+
+# Combine aisstream with a local NMEA receiver
+python ais_listener.py --bbox 54.5 25.0 57.5 27.5 \
+    --sources aisstream nmea-tcp \
+    --nmea-tcp 192.168.1.42:4002
+
+# Multiple NMEA endpoints
+python ais_listener.py --bbox 54.5 25.0 57.5 27.5 \
+    --sources nmea-tcp \
+    --nmea-tcp host-a:4002 --nmea-tcp host-b:10110
+
+# Replay a previous capture (no network)
+python ais_listener.py --bbox 54.5 25.0 57.5 27.5 \
+    --sources replay --replay-file ais_data/2026-05-23/14.jsonl
+
+# Run detached
+nohup python ais_listener.py --bbox 54.5 25.0 57.5 27.5 > ais.log 2>&1 &
+tail -f ais.log
+```
+
+### Full flag reference
+
+| Flag | Description |
+|---|---|
+| `--bbox W S E N` | **Required.** Four floats (lon/lat). |
+| `--sources {aisstream,nmea-tcp,replay} ...` | Which sources to run (default `aisstream`). |
+| `--nmea-tcp HOST:PORT` | NMEA-TCP endpoint(s). Repeat for multiple receivers. |
+| `--replay-file PATH` | JSONL file to replay. |
+| `--replay-delay SEC` | Sleep between replayed messages (default 0). |
+| `--output-dir PATH` | Where to write hourly JSONL files (default `./ais_data`). |
+| `--stats-interval SEC` | Seconds between stats log lines (default 60). |
+| `-v` / `--verbose` | DEBUG-level logging. |
+
+### Adding a fourth source
+
+Subclass `Source`, implement `async def run(self, bbox, queue, stats)`, and call `await self._emit(raw_payload_dict, bbox, queue, stats)` for each message. Add a branch in `normalize()` to map your payload to the canonical schema, then add a `choices` entry on `--sources` and a constructor in `build_sources()`. The framework handles bbox filtering, queue plumbing, writing, stats, and shutdown.
+
+---
+
+## Fusion workflow
+
+The whole point of the toolkit is correlating SAR detections with AIS positions.
+
+```bash
+# Terminal 1: collect AIS continuously over the AOI
+python ais_listener.py --bbox 54.5 25.0 57.5 27.5
+
+# Terminal 2: every few days, pull new SAR scenes and render them
+python download_sar.py --days 7
+python visualisation.py --list
+python visualisation.py <ID>
+```
+
+For each rendered scene, look up the acquisition timestamp in `data/safe/<scene>.json` (`ContentDate.Start`) and pull AIS records from the matching `ais_data/YYYY-MM-DD/HH.jsonl` files within ±5 minutes. Project AIS lat/lon onto the JPG using the tile manifest's pixel ranges, and:
+
+- **SAR detection with matching AIS** → identified ship (you can pull MMSI, name, type)
+- **SAR detection without matching AIS** → dark vessel, worth investigating
+
+That second category is the operational signal. It's where this toolkit becomes useful versus just a ship-counting exercise.
+
+---
+
+## Caveats and honesty
+
+**Coverage gaps.** Sentinel-1 IW revisits Hormuz every ~3 days when combining ascending and descending orbits. Terrestrial AIS coverage from aisstream.io is patchy in the middle of the strait. The operationally interesting small craft — wooden dhows, fiberglass IRGC fast boats — have weak radar cross-sections and routinely don't broadcast AIS at all. Free tooling has limits; this is a starting point, not a complete picture.
+
+**SAR resolution.** Sentinel-1 IW GRDH is ~20 m resolution. You can detect a 30 m vessel reliably, estimate its length to within ~20 m, but you cannot classify ship type from pixels alone at this resolution. Sub-meter classification needs commercial SAR (Umbra, Capella, ICEYE) — those have free *sample* datasets but no systematic coverage.
+
+**Sigma0 vs gamma0.** The script uses σ⁰ ellipsoid (no DEM-based terrain correction). For maritime AOIs this is fine. For coastal or terrain-affected scenes you'd want full radiometric terrain correction via SNAP.
+
+**Not for navigation or operational use.** This is an OSINT / research tool. The data has gaps, the calibration is approximate, the AIS feed is incomplete. Do not use it to decide whether to sail through a strait.
+
+---
+
+## Dependencies
 
 ```text
-data/
-├── safe/
-│   ├── S1A_IW_GRDH_1SDV_20260520T024545_..._C5BD.SAFE.zip        # raw GRD product (~1 GB)
-│   ├── S1A_IW_GRDH_1SDV_20260520T024545_..._C5BD.SAFE.json       # sidecar: catalog metadata + GeoFootprint
-│   ├── S1A_IW_GRDH_1SDV_..._falsecolor_r00c00_y000000-006250_x000000-005500.jpg   # tile
-│   ├── S1A_IW_GRDH_1SDV_..._falsecolor_r00c01_y000000-006250_x005500-011000.jpg
-│   ├── … (12 tiles total)
-│   └── S1A_IW_GRDH_1SDV_..._falsecolor_tiles.json                # tile manifest
-└── previews/
-    ├── S1A_IW_GRDH_1SDV_..._C5BD.SAFE.tif                        # 3-band σ⁰ GeoTIFF, clipped to bbox
-    ├── S1A_IW_GRDH_1SDV_..._C5BD.SAFE.json                       # sidecar (same content)
-    └── S1A_IW_GRDH_1SDV_..._falsecolor.jpg                       # rendered preview
+requests
+python-dotenv
+tqdm
+numpy
+tifffile
+imagecodecs        # ZSTD decode for Sentinel Hub TIFFs
+Pillow
+websockets
+pyais              # only needed if you use --sources nmea-tcp
 ```
 
-The sidecar JSON contains the full CDSE catalog entry — `Id`, `Name`,
-`ContentDate`, `Footprint` (WKT), `GeoFootprint` (GeoJSON), `S3Path`. Useful
-for downstream tooling and required for `--full-coverage` filtering.
-
----
-
-## Resource considerations
-
-### Storage
-
-- Per scene: ~1 GB SAFE + ~30 MB preview GeoTIFF + ~30–60 MB rendered tiles.
-- A month of Hormuz coverage: typically 8–20 scenes → 10–25 GB.
-
-### Memory (visualisation)
-
-- Reading both VV and VH measurement TIFFs from a SAFE: ~1.6 GB peak.
-- Processing one ≤ 8000 × 8000 tile: ~1.5 GB extra.
-- **Peak: ~3 GB** with default `--max-dim 8000`.
-- Set `--max-dim 4000` if you're tight on RAM (more tiles, half the peak).
-- Set `--max-dim 30000` for a single-file monolithic render if you have
-  10+ GB of RAM and want one giant JPG.
-
-### API quotas
-
-- **CDSE OData**: very permissive for personal use; rate-limited but you'd
-  have to be aggressive to hit it.
-- **Sentinel Hub Process API**: free tier gives 30,000 Processing Units
-  (PU) per month. A single Hormuz-bbox preview costs ~2–5 PU. The script
-  uses ~3 PU per scene → comfortably under quota for daily collection.
-
----
-
-## Limitations and caveats
-
-- **Small/wooden/fiberglass vessels are often invisible.** Dhows and small
-  fishing boats — exactly the ones often most operationally interesting in
-  Hormuz — have weak radar cross-sections and frequently disappear into
-  sea clutter, especially in rough seas. Sentinel-1 reliably shows
-  tankers and cargo ships; everything else is partial.
-- **No AIS correlation.** The whole point of free SAR for ship-spotting is
-  identifying "dark" vessels (no AIS broadcast). This toolkit does the SAR
-  half; you need separate AIS data (aisstream.io, Global Fishing Watch
-  API) to compute the gap.
-- **Revisit cadence.** Hormuz gets a useful Sentinel-1 pass every 2–4 days
-  on average with the current Sentinel-1A + Sentinel-1C constellation; only
-  about half of those are dual-pol VV+VH. Plan accordingly.
-- **Footprint ≠ swath.** A scene's footprint can be ~250 × 250 km, but each
-  scene is acquired along an oriented ground track. The Hormuz default
-  bbox (300 × 280 km) is larger than a single scene's along-track length,
-  so `--full-coverage` against the default bbox will routinely return
-  zero scenes.
-- **Output JPGs are not georeferenced.** The preview GeoTIFF *is*
-  georeferenced (and Sentinel Hub orthorectifies it), but the rendered
-  JPGs are in image coordinates only. The tile manifest gives you the
-  pixel ranges; converting to lon/lat for the SAFE-rendered JPGs requires
-  the GCPs from `annotation/*.xml`.
-- **σ⁰ vs γ⁰.** The script renders σ⁰. For quantitative work
-  (cross-scene comparisons, time-series at fixed targets) γ⁰ is the
-  better-behaved quantity. Adding it requires parsing the incidence-angle
-  grid — straightforward but not implemented here.
-
----
-
-## Where to go next
-
-If you want to turn this from a viewer into a real ship-tracking system:
-
-1. **Ship detection (CFAR)** — run a Constant False Alarm Rate detector on
-   the calibrated VV σ⁰ image. SUMO, `pyroSAR`, or a hand-rolled CFAR are
-   all reasonable. Each detection is an (x, y) pixel + estimated length.
-2. **Georeferencing detections** — use the GCPs in
-   `annotation/*-grd-*.xml` to convert (line, pixel) → (lon, lat).
-3. **AIS fusion** — pull AIS from aisstream.io (or Global Fishing Watch) for
-   ±15 minutes around the scene acquisition time, filter to the bbox, and
-   correlate. SAR detections with no matching AIS track within e.g. 200 m
-   are "dark" candidates.
-4. **Time-series** — assemble σ⁰ stacks at fixed coordinates (anchorages,
-   port gates) to track traffic patterns over weeks.
-5. **Classification** — train or fine-tune a CNN on labelled SAR ship
-   chips. Public starting datasets: OpenSARShip, FUSAR-Ship, HRSID, SSDD.
-
----
-
-## Troubleshooting
-
-### `ModuleNotFoundError: No module named 'compression'`
-
-`tifffile` is trying to decode a ZSTD-compressed TIFF (Sentinel Hub
-default) and falling through to a Python 3.14-only stdlib module. Install
-the optional codec backend:
-
-```bash
-pip install imagecodecs
-```
-
-### "No scenes found" but I'm sure there are some
-
-Try `--days 30` and `--list-only` to widen the window. If the catalog is
-still empty, the CDSE catalog occasionally lags ingestion by a few hours —
-check <https://dataspace.copernicus.eu/news>.
-
-### `--full-coverage` returns zero scenes
-
-Your bbox is larger than a single Sentinel-1 IW scene footprint
-(~250 × 250 km maximum). Shrink the bbox or drop the flag.
-
-### Out of memory during rendering
-
-Lower `--max-dim`:
-
-```bash
-python visualisation.py <ID> --max-dim 4000   # ~1.5 GB peak instead of ~3 GB
-```
-
-### Token / 401 errors
-
-CDSE access tokens expire after 10 minutes. The script refreshes them
-before each SAFE download, but if a single SAFE takes longer than ~10
-minutes (very large product, slow connection) the download may fail
-partway. Re-run — the partial file will be cleaned up and the download
-resumes from scratch.
+A `requirements.txt` is included.
 
 ---
 
 ## License
 
-[MIT](./LICENSE). Do what you want with it.
-
-The data itself remains subject to its sources' terms:
-
-- Sentinel-1 imagery — Copernicus Open Access, free for any use including
-  commercial, with attribution.
-- Sentinel Hub Process API — free tier subject to fair use.
+[MIT](LICENSE) — do what you want, no warranty, attribution appreciated.
 
 ---
 
 ## Acknowledgments
 
-- **ESA / Copernicus** — Sentinel-1 mission and free open data policy.
-- **Copernicus Data Space Ecosystem** — catalog and product distribution.
-- **Sentinel Hub** — Process API for on-the-fly imagery.
-- **`tifffile`** by Christoph Gohlke — robust BigTIFF reading.
-- The broader **OSINT / SAR community** — Bellingcat, TankerTrackers,
-  Global Fishing Watch, and the academic literature on SAR ship
-  detection that this rests on.
+This wouldn't exist without:
+
+- **ESA Copernicus & Sentinel-1** for free, open, high-quality SAR data
+- **Sentinel Hub on CDSE** for the Process API that makes clipped previews trivial
+- **aisstream.io** for keeping a global AIS WebSocket genuinely free
+- The **pyais** maintainers for the cleanest NMEA decoder in Python
+- The broader OSINT community — Bellingcat, TankerTrackers, Global Fishing Watch — for showing what's possible with public data and pointing the way
+
+---
+
+## Contributing
+
+Issues and PRs welcome. Particularly interested in: a fusion script that does the SAR-vs-AIS comparison automatically, a Folium/QGIS overlay generator, additional AIS sources (regional public feeds, Global Fishing Watch API integration), and CFAR-based ship detection on the rendered tiles.
