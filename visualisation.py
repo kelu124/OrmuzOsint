@@ -123,6 +123,77 @@ def print_listing(catalog: dict[str, dict]) -> None:
     print(f"{len(catalog)} scene(s). Pass an ID (or unique prefix) to render.")
 
 
+def list_jpgs(safe_dir: Path = SAFE_DIR) -> None:
+    """Print all JPGs in safe_dir with filename structure and EXIF metadata."""
+    all_jpgs = sorted(safe_dir.glob("*.jpg")) if safe_dir.is_dir() else []
+
+    print("Filename structure")
+    print("  Single tile : <scene>_falsecolor.jpg")
+    print("  Multi-tile  : <scene>_falsecolor_r{row:02d}c{col:02d}"
+          "_y{y0}-{y1}_x{x0}-{x1}.jpg")
+    print()
+
+    if not all_jpgs:
+        print(f"No JPG files found in {safe_dir}/")
+        return
+
+    try:
+        import piexif
+        has_piexif = True
+    except ImportError:
+        has_piexif = False
+        print("(piexif not installed — install with: pip install piexif)")
+        print()
+
+    def _dms_to_dec(dms, ref) -> float | None:
+        if not dms or not ref:
+            return None
+        d = dms[0][0] / dms[0][1]
+        m = dms[1][0] / dms[1][1]
+        s = dms[2][0] / dms[2][1]
+        val = d + m / 60 + s / 3600
+        if ref.decode(errors="replace") in ("S", "W"):
+            val = -val
+        return val
+
+    for jpg in all_jpgs:
+        print(f"  {jpg.name}")
+        if not has_piexif:
+            continue
+        try:
+            exif = piexif.load(str(jpg))
+            ifd0     = exif.get("0th", {})
+            exif_ifd = exif.get("Exif", {})
+            gps_ifd  = exif.get("GPS", {})
+
+            fields = [
+                ("ImageDescription", ifd0.get(piexif.ImageIFD.ImageDescription)),
+                ("Make",             ifd0.get(piexif.ImageIFD.Make)),
+                ("Software",         ifd0.get(piexif.ImageIFD.Software)),
+                ("DateTimeOriginal", exif_ifd.get(piexif.ExifIFD.DateTimeOriginal)),
+            ]
+            for label, val in fields:
+                if val:
+                    print(f"    {label:<18}: {val.decode(errors='replace')}")
+
+            lat = _dms_to_dec(
+                gps_ifd.get(piexif.GPSIFD.GPSLatitude),
+                gps_ifd.get(piexif.GPSIFD.GPSLatitudeRef),
+            )
+            lon = _dms_to_dec(
+                gps_ifd.get(piexif.GPSIFD.GPSLongitude),
+                gps_ifd.get(piexif.GPSIFD.GPSLongitudeRef),
+            )
+            if lat is not None and lon is not None:
+                print(f"    {'GPS':<18}: {lat:.6f}°, {lon:.6f}°")
+            datum = gps_ifd.get(piexif.GPSIFD.GPSMapDatum)
+            if datum:
+                print(f"    {'GPSMapDatum':<18}: {datum.decode(errors='replace')}")
+        except Exception as exc:
+            print(f"    (EXIF read error: {exc})")
+        print()
+
+
 # ---------------------------------------------------------------------------
 # Bbox / coverage filtering
 # ---------------------------------------------------------------------------
@@ -1049,6 +1120,10 @@ def parse_args(argv=None):
     p.add_argument("scene_id", nargs="?", help="Scene ID (or unique prefix).")
     p.add_argument("--list", action="store_true",
                    help="List scenes in data/ and exit.")
+    p.add_argument("--list-jpgs", action="store_true",
+                   help="List all JPGs in data/safe/, explain the filename structure, "
+                        "and print EXIF metadata (datetime, GPS, Make, Software, "
+                        "ImageDescription, GPSMapDatum) for each file. Then exit.")
     p.add_argument("--max-dim", type=int, default=DEFAULT_MAX_DIM,
                    help=f"Max pixel dim per tile (default {DEFAULT_MAX_DIM}). "
                         f"Larger = fewer tiles + more RAM; smaller = more "
@@ -1111,6 +1186,10 @@ def main(argv=None) -> int:
 
     if args.list:
         print_listing(catalog)
+        return 0
+
+    if args.list_jpgs:
+        list_jpgs()
         return 0
 
     # --all: batch render every scene in the catalog
