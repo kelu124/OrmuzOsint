@@ -280,8 +280,22 @@ The `--crop-bbox` flag uses the scene's geolocation grid (for SAFE products) or 
 | `--bbox W S E N` | Reference area for `--full-coverage` filtering (default Hormuz). |
 | `--full-coverage` | Only render scenes whose footprint fully contains the bbox. |
 | `--crop-bbox W S E N` | Crop the output image to this geographic bbox (min_lon min_lat max_lon max_lat). |
-| `--trim-safe` | After rendering, delete `measurement/` entries (raw GRD TIFFs) from the SAFE zip to reclaim ~1 GB. Annotation, calibration, and manifest files are kept. **Irreversible.** |
+| `--trim-safe` | After rendering, delete `measurement/` entries (raw GRD TIFFs) from the SAFE zip to reclaim ~1 GB. Annotation, calibration, and manifest files are kept. See recovery note below. |
 | `-v` / `--verbose` | DEBUG-level logging. |
+
+### Disk-space management and recovery
+
+`--trim-safe` rewrites the SAFE zip in-place, keeping only annotation, calibration, manifest, and support files (~5–20 MB) and discarding the raw GRD measurement TIFFs (~900 MB–1 GB). The operation is atomic: a `.trimming` temp file is written first, then renamed over the original. If writing fails the original is untouched.
+
+**Automatic recovery:** if you later ask `visualisation.py` to render (or re-render) a scene whose zip has already been trimmed, the script detects the missing `measurement/` folder, fetches a fresh full SAFE from CDSE using `CDSE_USER` / `CDSE_PASSWORD` from `.env`, and then renders normally. The re-download overwrites the trimmed zip. If credentials are absent or the download fails, a clear error is logged and the script exits with code 1.
+
+```bash
+# Render + free 1 GB afterwards
+python visualisation.py <ID> --trim-safe
+
+# Later, re-render (auto-downloads if the zip was trimmed)
+python visualisation.py <ID> --crop-bbox 56.05 27.10 56.29 27.25
+```
 
 ### Memory usage
 
@@ -411,8 +425,10 @@ bash bandar_abbas_daily.sh --with-safe
 The script:
 1. Sources `.env` for credentials
 2. Runs `download_sar.py --full-coverage` with the Bandar Abbas bbox
-3. Renders every scene found in `data/` with `visualisation.py --crop-bbox`
+3. Renders every scene found in `data/` with `visualisation.py --crop-bbox --trim-safe`
 4. Prints a summary of output files
+
+`--trim-safe` is applied by default: after tiling each SAFE product the raw measurement TIFFs (~1 GB) are removed, keeping the zip at ~10–20 MB. If a zip was trimmed by a previous run and tiles need to be regenerated, `visualisation.py` automatically re-downloads the full product before rendering.
 
 Requires `CDSE_USER`, `CDSE_PASSWORD`, `SH_CLIENT_ID`, and `SH_CLIENT_SECRET` in `.env`. Sentinel Hub previews (~30–100 MB, ~130 m/px) are downloaded by default. Full SAFE products (~1 GB each, ~10 m/px) require `--with-safe`.
 

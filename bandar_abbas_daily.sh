@@ -109,8 +109,11 @@ FAILED=0
 while IFS= read -r SID; do
   [[ -z "$SID" ]] && continue
   echo "--- Rendering ${SID} (crop to Bandar Abbas bbox) ---"
+  # --trim-safe removes the raw measurement/ TIFFs (~1 GB) after tiling.
+  # If the zip was already trimmed, visualisation.py auto-downloads a fresh copy first.
   if python3 visualisation.py "${SID}" \
-      --crop-bbox "${BBOX_W}" "${BBOX_S}" "${BBOX_E}" "${BBOX_N}"; then
+      --crop-bbox "${BBOX_W}" "${BBOX_S}" "${BBOX_E}" "${BBOX_N}" \
+      --trim-safe; then
     RENDERED=$((RENDERED + 1))
   else
     echo "WARNING: render failed for scene ${SID}"
