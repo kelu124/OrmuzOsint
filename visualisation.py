@@ -911,6 +911,73 @@ def _is_safe_trimmed(safe_zip: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _download_safe_for_scene(info: dict) -> Path | None:
+    """Download the SAFE zip for a scene that has no local zip.
+
+    Reads the product ID from the sidecar JSON written by download_sar.py
+    (expected alongside the preview TIF), authenticates with CDSE using
+    CDSE_USER / CDSE_PASSWORD from the environment or .env, and streams the
+    zip into data/safe/.  Returns the zip path on success, None on failure.
+    """
+    def _load_dotenv() -> None:
+        for candidate in (Path(__file__).parent / ".env", Path(".env")):
+            if candidate.exists():
+                for line in candidate.read_text().splitlines():
+                    m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)=(.*)", line)
+                    if m and m.group(1) not in os.environ:
+                        os.environ[m.group(1)] = m.group(2).strip()
+                break
+
+    _load_dotenv()
+    user = os.environ.get("CDSE_USER", "")
+    pw   = os.environ.get("CDSE_PASSWORD", "")
+    if not user or not pw:
+        log.error("CDSE_USER / CDSE_PASSWORD not set — cannot download SAFE.")
+        return None
+
+    # Locate sidecar JSON (written by download_sar.py alongside the preview TIF)
+    sidecar_path: Path | None = None
+    if "preview" in info:
+        sc = info["preview"].with_suffix(".json")
+        if sc.exists():
+            sidecar_path = sc
+    if sidecar_path is None:
+        log.error(
+            "No sidecar JSON for scene '%s' — cannot determine CDSE product ID.",
+            info["name"],
+        )
+        return None
+
+    meta = json.loads(sidecar_path.read_text())
+    pid  = meta.get("Id")
+    name = meta.get("Name") or info["name"]
+    if not pid:
+        log.error("Sidecar %s has no 'Id' field.", sidecar_path.name)
+        return None
+
+    # Import download_sar dynamically to reuse its download_safe() function
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "download_sar", Path(__file__).parent / "download_sar.py"
+    )
+    dl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dl)  # type: ignore[union-attr]
+
+    SAFE_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("Downloading SAFE for '%s' (product %s)…", name, pid)
+    try:
+        path, cached = dl.download_safe(pid, name, user, pw, SAFE_DIR)
+        log.info("SAFE %s: %s", "cached" if cached else "downloaded", path.name)
+        # Mirror sidecar next to the zip so downstream tools can find it
+        safe_sidecar = path.with_suffix(".json")
+        if not safe_sidecar.exists():
+            safe_sidecar.write_text(sidecar_path.read_text())
+        return path
+    except Exception as e:
+        log.error("SAFE download failed: %s", e)
+        return None
+
+
 def _render_scene(
     args: argparse.Namespace,
     info: dict,
@@ -938,8 +1005,12 @@ def _render_scene(
         raise FileNotFoundError(f"No usable file found for scene '{name}'.")
 
     if source != "safe":
-        log.info("No SAFE zip for scene '%s' — skipping (preview-only scenes are not rendered).", name)
-        return []
+        log.info("No SAFE zip for scene '%s' — attempting download…", name)
+        safe_path = _download_safe_for_scene(info)
+        if safe_path is None:
+            log.error("Cannot render '%s': no SAFE zip and download unavailable.", name)
+            return []
+        info = {**info, "safe": safe_path}
 
     src: Path = info["safe"]
     out_dir = src.parent
