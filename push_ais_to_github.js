@@ -89,7 +89,8 @@ async function main() {
       encoding: 'base64',
     });
     console.log(blob.sha);
-    treeItems.push({ path: filePath, mode: '100644', type: 'blob', sha: blob.sha });
+    const execBit = fs.statSync(filePath).mode & 0o111;
+    treeItems.push({ path: filePath, mode: execBit ? '100755' : '100644', type: 'blob', sha: blob.sha });
   }
 
   // 3. Create new tree
