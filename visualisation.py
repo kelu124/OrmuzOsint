@@ -921,9 +921,16 @@ def _render_scene(
     else:
         raise FileNotFoundError(f"No usable file found for scene '{name}'.")
 
+    src: Path = info[source]
+    out_dir = src.parent
+
+    # Idempotency: if any falsecolor JPG already exists for this scene, skip entirely.
+    existing = sorted(out_dir.glob(f"{name}_falsecolor*.jpg"))
+    if existing:
+        log.info("Tiles already present (%d file(s)) — skipping.", len(existing))
+        return []
+
     if source == "safe":
-        src: Path = info["safe"]
-        out_dir = src.parent
         log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
         if _is_safe_trimmed(src):
             log.warning(
@@ -935,8 +942,6 @@ def _render_scene(
         if args.trim_safe:
             trim_measurement_folder(src)
     else:
-        src = info["preview"]
-        out_dir = src.parent
         log.info("Source: preview GeoTIFF")
         written = render_preview(src, out_dir, name, crop_bbox=crop_bbox)
 
@@ -1025,20 +1030,25 @@ def main(argv=None) -> int:
         if not catalog:
             log.warning("No scenes found in data/ — nothing to render.")
             return 0
-        failed = 0
+        rendered = failed = skipped = 0
         for sid, info in sorted(catalog.items(), key=lambda x: x[1]["name"]):
             log.info("═" * 60)
             log.info("[%s] %s", sid, info["name"])
             try:
                 written = _render_scene(args, info)
-                log.info("  ✓ %d file(s)", len(written))
+                if written:
+                    log.info("  ✓ %d file(s)", len(written))
+                    rendered += 1
+                else:
+                    log.info("  — skipped (tiles already present)")
+                    skipped += 1
             except Exception as exc:
                 log.error("  FAILED: %s", exc)
                 failed += 1
         log.info("═" * 60)
         log.info(
-            "Batch done: %d rendered, %d failed.",
-            len(catalog) - failed, failed,
+            "Batch done: %d rendered, %d skipped, %d failed.",
+            rendered, skipped, failed,
         )
         return 1 if failed else 0
 
@@ -1069,6 +1079,10 @@ def main(argv=None) -> int:
     except Exception as exc:
         log.error("Render failed: %s", exc)
         return 1
+
+    if not written:
+        log.info("Scene already rendered — nothing to do.")
+        return 0
 
     log.info("─" * 60)
     log.info("✓ Wrote %d file(s):", len(written))
