@@ -944,8 +944,9 @@ def _render_scene(
     # directory so that source files in data/previews/ are never treated as tile markers.
     out_dir = src.parent if source == "safe" else RENDERS_DIR
 
-    # Idempotency: if any falsecolor JPG already exists for this scene, skip entirely.
-    existing = sorted(out_dir.glob(f"{name}_falsecolor*.jpg"))
+    # Idempotency: only rc-tile files (_r{row}c{col}_…) count as completion markers;
+    # single-tile outputs and stray JPGs are ignored.
+    existing = sorted(out_dir.glob(f"{name}_falsecolor_r*c*.jpg"))
     if existing:
         log.info("Tiles already present (%d file(s)) — skipping.", len(existing))
         return []
