@@ -262,7 +262,7 @@ python visualisation.py 1633
 python visualisation.py --all
 
 # Render all scenes with a geographic crop and disk cleanup
-python visualisation.py --all --crop-bbox 56.05 27.10 56.29 27.25 --trim-safe
+python visualisation.py --all --crop-bbox 56.12176 26.94227 56.55762 27.24841 --trim-safe
 
 # Force the medium-res preview path (faster, lower res)
 python visualisation.py 163390df --prefer preview
@@ -271,7 +271,7 @@ python visualisation.py 163390df --prefer preview
 python visualisation.py 163390df --max-dim 16000
 
 # Crop the rendered image to a geographic bounding box (lon/lat)
-python visualisation.py 163390df --crop-bbox 56.05 27.10 56.29 27.25
+python visualisation.py 163390df --crop-bbox 56.12176 26.94227 56.55762 27.24841
 ```
 
 The `--crop-bbox` flag uses the scene's geolocation grid (for SAFE products) or GeoTIFF spatial tags (for previews) to compute the exact pixel region that covers the requested area. For SAFE files the σ⁰ calibration LUT is still sampled at original-image coordinates so the result is radiometrically correct. If the crop bbox does not overlap the scene, the full image is rendered with a warning.
@@ -301,7 +301,7 @@ The `--crop-bbox` flag uses the scene's geolocation grid (for SAFE products) or 
 python visualisation.py <ID> --trim-safe
 
 # Later, re-render (auto-downloads if the zip was trimmed)
-python visualisation.py <ID> --crop-bbox 56.05 27.10 56.29 27.25
+python visualisation.py <ID> --crop-bbox 56.12176 26.94227 56.55762 27.24841
 ```
 
 ### Memory usage
@@ -415,7 +415,7 @@ Subclass `Source`, implement `async def run(self, bbox, queue, stats)`, and call
 
 A convenience wrapper that downloads the last N days of Sentinel-1 scenes that **fully cover the Port of Bandar Abbas** and renders each as a false-color crop of the port area.
 
-**Port of Bandar Abbas bbox:** `W=56.05  S=27.10  E=56.29  N=27.25`
+**Port of Bandar Abbas bbox:** `W=56.12176  S=26.94227  E=56.55762  N=27.24841`
 Covers Shahid Rajaee Container Port (west), the old fishing/commercial port (east), and the anchorage zone south of the breakwater.
 
 ```bash

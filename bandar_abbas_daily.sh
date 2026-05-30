@@ -6,7 +6,7 @@
 # false-color crop of that geographic area using visualisation.py.
 #
 # Bandar Abbas bbox (Shahid Rajaee + old port + anchorage):
-#   W=56.05  S=27.10  E=56.29  N=27.25
+#   W=56.12176  S=26.94227  E=56.55762  N=27.24841
 #
 # Usage:
 #   bash bandar_abbas_daily.sh
@@ -28,10 +28,10 @@ cd "$SCRIPT_DIR"
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-BBOX_W=56.05
-BBOX_S=27.10
-BBOX_E=56.29
-BBOX_N=27.25
+BBOX_W=56.12176
+BBOX_S=26.94227
+BBOX_E=56.55762
+BBOX_N=27.24841
 DAYS=7
 WITH_SAFE=false
 
