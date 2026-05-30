@@ -280,6 +280,7 @@ The `--crop-bbox` flag uses the scene's geolocation grid (for SAFE products) or 
 | `--bbox W S E N` | Reference area for `--full-coverage` filtering (default Hormuz). |
 | `--full-coverage` | Only render scenes whose footprint fully contains the bbox. |
 | `--crop-bbox W S E N` | Crop the output image to this geographic bbox (min_lon min_lat max_lon max_lat). |
+| `--trim-safe` | After rendering, delete `measurement/` entries (raw GRD TIFFs) from the SAFE zip to reclaim ~1 GB. Annotation, calibration, and manifest files are kept. **Irreversible.** |
 | `-v` / `--verbose` | DEBUG-level logging. |
 
 ### Memory usage

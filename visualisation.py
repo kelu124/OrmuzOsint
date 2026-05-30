@@ -731,6 +731,58 @@ def render_safe(
 
 
 # ---------------------------------------------------------------------------
+# SAFE zip trimming — remove raw measurement TIFFs after rendering
+# ---------------------------------------------------------------------------
+
+
+def trim_measurement_folder(safe_zip: Path) -> None:
+    """Remove measurement/ entries from a SAFE zip in-place.
+
+    A Sentinel-1 SAFE zip's measurement/ subdirectory holds the raw GRD
+    binary TIFFs (the bulk of the ~1 GB file).  After all tiles have been
+    rendered, those can be dropped to reclaim disk space while preserving
+    everything else (annotation XMLs, calibration LUTs, manifest, support).
+
+    The operation is atomic: a temp file is written alongside the original,
+    then renamed over it.  If writing fails the original is left untouched.
+    Already-trimmed zips (no measurement/ entries) are silently skipped.
+    """
+    with zipfile.ZipFile(safe_zip) as z:
+        all_members = z.namelist()
+        keep = [m for m in all_members if "/measurement/" not in m]
+        drop = [m for m in all_members if "/measurement/" in m]
+
+    if not drop:
+        log.info("Zip already trimmed (no measurement/ entries): %s", safe_zip.name)
+        return
+
+    size_before_mb = safe_zip.stat().st_size / 1e6
+    log.info(
+        "Trimming %d measurement/ entr%s from %s (%.0f MB)…",
+        len(drop), "y" if len(drop) == 1 else "ies", safe_zip.name, size_before_mb,
+    )
+
+    tmp = safe_zip.with_suffix(".trimming")
+    try:
+        with zipfile.ZipFile(safe_zip) as src, \
+             zipfile.ZipFile(tmp, "w") as dst:
+            for member in keep:
+                info = src.getinfo(member)
+                dst.writestr(info, src.read(member))
+        tmp.replace(safe_zip)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    size_after_mb = safe_zip.stat().st_size / 1e6
+    log.info(
+        "Trimmed %s: %.0f MB → %.0f MB  (freed %.0f MB)",
+        safe_zip.name, size_before_mb, size_after_mb,
+        size_before_mb - size_after_mb,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -766,6 +818,13 @@ def parse_args(argv=None):
         metavar=("W", "S", "E", "N"),
         help="Crop the rendered image to this geographic bbox (min_lon min_lat max_lon max_lat). "
              "Uses the geolocation grid (SAFE) or GeoTIFF tags (preview) to compute pixel bounds.",
+    )
+    p.add_argument(
+        "--trim-safe", action="store_true",
+        help="After rendering, remove measurement/ entries (raw GRD TIFFs) "
+             "from the SAFE zip to reclaim ~1 GB of disk space. "
+             "Annotation, calibration, and manifest files are preserved. "
+             "Irreversible — re-download via download_sar.py if needed.",
     )
     p.add_argument("-v", "--verbose", action="store_true",
                    help="DEBUG-level logging.")
@@ -833,6 +892,8 @@ def main(argv=None) -> int:
         out_dir = src.parent
         log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
         written = render_safe(src, out_dir, name, max_dim=args.max_dim, crop_bbox=crop_bbox)
+        if args.trim_safe:
+            trim_measurement_folder(src)
     else:
         src = info["preview"]
         out_dir = src.parent
