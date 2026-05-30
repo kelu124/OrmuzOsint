@@ -891,6 +891,59 @@ def _redownload_safe(safe_zip: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-scene render helper (used by single-scene and --all batch paths)
+# ---------------------------------------------------------------------------
+
+
+def _render_scene(
+    args: argparse.Namespace,
+    info: dict,
+) -> list[Path]:
+    """Render one scene; return list of written output files.
+
+    Handles source selection, SAFE-trim auto-recovery, and post-render
+    trimming.  Raises on unrecoverable errors so callers can decide whether
+    to abort or continue.
+    """
+    name = info["name"]
+    crop_bbox = tuple(args.crop_bbox) if args.crop_bbox else None
+    if crop_bbox:
+        log.info("Crop bbox: %s", crop_bbox)
+
+    if args.prefer == "safe" and "safe" in info:
+        source = "safe"
+    elif args.prefer == "preview" and "preview" in info:
+        source = "preview"
+    elif "safe" in info:
+        source = "safe"
+    elif "preview" in info:
+        source = "preview"
+    else:
+        raise FileNotFoundError(f"No usable file found for scene '{name}'.")
+
+    if source == "safe":
+        src: Path = info["safe"]
+        out_dir = src.parent
+        log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
+        if _is_safe_trimmed(src):
+            log.warning(
+                "SAFE zip has been trimmed (measurement/ removed). "
+                "Attempting automatic re-download…"
+            )
+            _redownload_safe(src)
+        written = render_safe(src, out_dir, name, max_dim=args.max_dim, crop_bbox=crop_bbox)
+        if args.trim_safe:
+            trim_measurement_folder(src)
+    else:
+        src = info["preview"]
+        out_dir = src.parent
+        log.info("Source: preview GeoTIFF")
+        written = render_preview(src, out_dir, name, crop_bbox=crop_bbox)
+
+    return written
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -932,7 +985,14 @@ def parse_args(argv=None):
         help="After rendering, remove measurement/ entries (raw GRD TIFFs) "
              "from the SAFE zip to reclaim ~1 GB of disk space. "
              "Annotation, calibration, and manifest files are preserved. "
-             "Irreversible — re-download via download_sar.py if needed.",
+             "If a trimmed zip is later rendered again, the script re-downloads "
+             "the full product automatically.",
+    )
+    p.add_argument(
+        "--all", action="store_true",
+        help="Render every scene discovered in data/ (equivalent to running "
+             "the script once per scene ID). Continues on per-scene errors. "
+             "Combine with --crop-bbox, --trim-safe, etc.",
     )
     p.add_argument("-v", "--verbose", action="store_true",
                    help="DEBUG-level logging.")
@@ -960,8 +1020,35 @@ def main(argv=None) -> int:
         print_listing(catalog)
         return 0
 
+    # --all: batch render every scene in the catalog
+    if args.all:
+        if not catalog:
+            log.warning("No scenes found in data/ — nothing to render.")
+            return 0
+        failed = 0
+        for sid, info in sorted(catalog.items(), key=lambda x: x[1]["name"]):
+            log.info("═" * 60)
+            log.info("[%s] %s", sid, info["name"])
+            try:
+                written = _render_scene(args, info)
+                log.info("  ✓ %d file(s)", len(written))
+            except Exception as exc:
+                log.error("  FAILED: %s", exc)
+                failed += 1
+        log.info("═" * 60)
+        log.info(
+            "Batch done: %d rendered, %d failed.",
+            len(catalog) - failed, failed,
+        )
+        return 1 if failed else 0
+
+    # Single scene
     if not args.scene_id:
-        print("Provide a scene ID, or use --list to see options.", file=sys.stderr)
+        print(
+            "Provide a scene ID, use --list to see options, "
+            "or --all to render every scene.",
+            file=sys.stderr,
+        )
         return 2
 
     matches = [sid for sid in catalog if sid.startswith(args.scene_id)]
@@ -975,55 +1062,13 @@ def main(argv=None) -> int:
 
     sid = matches[0]
     info = catalog[sid]
-    name = info["name"]
-    log.info("Scene: %s   id=%s", name, sid)
+    log.info("Scene: %s   id=%s", info["name"], sid)
 
-    # Pick source
-    if args.prefer == "safe" and "safe" in info:
-        source = "safe"
-    elif args.prefer == "preview" and "preview" in info:
-        source = "preview"
-    elif "safe" in info:
-        source = "safe"
-    elif "preview" in info:
-        source = "preview"
-    else:
-        log.error("No usable file for scene %s", sid)
+    try:
+        written = _render_scene(args, info)
+    except Exception as exc:
+        log.error("Render failed: %s", exc)
         return 1
-
-    crop_bbox = tuple(args.crop_bbox) if args.crop_bbox else None
-    if crop_bbox:
-        log.info("Crop bbox: %s", crop_bbox)
-
-    if source == "safe":
-        src: Path = info["safe"]
-        out_dir = src.parent
-        log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
-
-        if _is_safe_trimmed(src):
-            log.warning(
-                "SAFE zip has been trimmed (measurement/ removed). "
-                "Tiles cannot be (re-)generated without the raw data. "
-                "Attempting automatic re-download…"
-            )
-            try:
-                _redownload_safe(src)
-            except Exception as exc:
-                log.error("Re-download failed: %s", exc)
-                log.error(
-                    "Re-run download_sar.py to fetch a fresh copy, "
-                    "then retry visualisation.py."
-                )
-                return 1
-
-        written = render_safe(src, out_dir, name, max_dim=args.max_dim, crop_bbox=crop_bbox)
-        if args.trim_safe:
-            trim_measurement_folder(src)
-    else:
-        src = info["preview"]
-        out_dir = src.parent
-        log.info("Source: preview GeoTIFF")
-        written = render_preview(src, out_dir, name, crop_bbox=crop_bbox)
 
     log.info("─" * 60)
     log.info("✓ Wrote %d file(s):", len(written))

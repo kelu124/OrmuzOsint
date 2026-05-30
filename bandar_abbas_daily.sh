@@ -88,46 +88,20 @@ echo
 # --------------------------------------------------------------------------- #
 # Render
 # --------------------------------------------------------------------------- #
-echo "--- Discovering scenes in data/ ---"
+echo "--- Rendering all scenes (crop to Bandar Abbas bbox) ---"
 
-# parse the listing: lines starting with an 8-hex-char ID
-SCENE_IDS=$(python3 visualisation.py --list 2>/dev/null \
-  | awk '/^[0-9a-f]{8}[[:space:]]/ { print $1 }')
-
-if [[ -z "$SCENE_IDS" ]]; then
-  echo "No scenes found in data/ — nothing to render."
-  echo "(Download may have failed, or no Sentinel-1 passes covered this bbox.)"
-  exit 0
-fi
-
-echo "Found scene IDs: $(echo "$SCENE_IDS" | tr '\n' ' ')"
-echo
-
-RENDERED=0
-FAILED=0
-
-while IFS= read -r SID; do
-  [[ -z "$SID" ]] && continue
-  echo "--- Rendering ${SID} (crop to Bandar Abbas bbox) ---"
-  # --trim-safe removes the raw measurement/ TIFFs (~1 GB) after tiling.
-  # If the zip was already trimmed, visualisation.py auto-downloads a fresh copy first.
-  if python3 visualisation.py "${SID}" \
-      --crop-bbox "${BBOX_W}" "${BBOX_S}" "${BBOX_E}" "${BBOX_N}" \
-      --trim-safe; then
-    RENDERED=$((RENDERED + 1))
-  else
-    echo "WARNING: render failed for scene ${SID}"
-    FAILED=$((FAILED + 1))
-  fi
-  echo
-done <<< "$SCENE_IDS"
+# --all processes every scene in data/ in one call.
+# --trim-safe removes raw measurement/ TIFFs (~1 GB) after tiling.
+# If a zip was previously trimmed, visualisation.py auto-downloads it first.
+python3 visualisation.py --all \
+  --crop-bbox "${BBOX_W}" "${BBOX_S}" "${BBOX_E}" "${BBOX_N}" \
+  --trim-safe \
+  || echo "WARNING: one or more scenes failed — check output above."
 
 # --------------------------------------------------------------------------- #
 # Summary
 # --------------------------------------------------------------------------- #
-echo "=== Done: ${RENDERED} scene(s) rendered, ${FAILED} failed ==="
-if [[ "$RENDERED" -gt 0 ]]; then
-  echo "Images written to:"
-  find data/ -name '*_falsecolor*.jpg' -newer .env 2>/dev/null \
-    | sort | sed 's/^/  /'
-fi
+echo
+echo "=== Done — $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+echo "Images:"
+find data/ -name '*_falsecolor*.jpg' 2>/dev/null | sort | sed 's/^/  /'

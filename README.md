@@ -258,6 +258,12 @@ python visualisation.py --list
 python visualisation.py 163390df
 python visualisation.py 1633
 
+# Render all scenes in data/ in one call
+python visualisation.py --all
+
+# Render all scenes with a geographic crop and disk cleanup
+python visualisation.py --all --crop-bbox 56.05 27.10 56.29 27.25 --trim-safe
+
 # Force the medium-res preview path (faster, lower res)
 python visualisation.py 163390df --prefer preview
 
@@ -279,6 +285,7 @@ The `--crop-bbox` flag uses the scene's geolocation grid (for SAFE products) or 
 | `--prefer {safe,preview}` | Source preference when both exist (default `safe`). |
 | `--bbox W S E N` | Reference area for `--full-coverage` filtering (default Hormuz). |
 | `--full-coverage` | Only render scenes whose footprint fully contains the bbox. |
+| `--all` | Render every scene found in `data/` in one call. Continues past per-scene errors and prints a batch summary. Combines with all other flags. |
 | `--crop-bbox W S E N` | Crop the output image to this geographic bbox (min_lon min_lat max_lon max_lat). |
 | `--trim-safe` | After rendering, delete `measurement/` entries (raw GRD TIFFs) from the SAFE zip to reclaim ~1 GB. Annotation, calibration, and manifest files are kept. See recovery note below. |
 | `-v` / `--verbose` | DEBUG-level logging. |
