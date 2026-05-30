@@ -56,21 +56,18 @@ The default AOI is the Strait of Hormuz, but every script accepts `--bbox` so yo
                          │   Replay files           │
                          └────────────┬─────────────┘
                                       │
+                         ┌────────────▼─────────────┐
+                         │     ais_listener.py      │
+                         │  • Multi-source async    │
+                         │  • Bbox filter           │
+                         │  • Hourly JSONL output   │
+                         └────────────┬─────────────┘
+                                      │
                                       ▼
-                ┌─────────────────────┴───────────────────────┐
-                │                                             │
-   ┌────────────▼─────────────┐                ┌──────────────▼───────────┐
-   │        ais2.py           │                │     ais_listener.py      │
-   │  • aisstream only        │                │  • Multi-source async    │
-   │  • Streams text/JSONL    │                │  • Bbox filter           │
-   │  • Static-data enriched  │                │  • Hourly JSONL output   │
-   └────────────┬─────────────┘                └──────────────┬───────────┘
-                │                                             │
-                ▼                                             ▼
-       stdout / your-file.jsonl                    ais_data/YYYY-MM-DD/HH.jsonl
+                              ais_data/YYYY-MM-DD/HH.jsonl
 ```
 
-The two halves run independently and produce timestamped artifacts that can be cross-referenced offline: for every SAR scene's acquisition window, query the corresponding AIS data and compare positions.
+The two halves run independently and produce timestamped artifacts that can be cross-referenced offline: for every SAR scene's acquisition window, query the corresponding AIS hour file and compare positions.
 
 ---
 
@@ -79,9 +76,11 @@ The two halves run independently and produce timestamped artifacts that can be c
 ```
 .
 ├── download_sar.py        # Sentinel-1 downloader (SAFE + clipped preview)
-├── visualisation.py       # False-color renderer with native-res tiling
-├── ais2.py                # Minimal AIS streamer (text/JSONL to stdout)
-├── ais_listener.py        # Multi-source AIS collector (background daemon)
+├── visualisation.py       # False-color renderer with native-res tiling + bbox crop
+├── ais_listener.py        # Multi-source AIS collector (Python)
+├── ais_listener.js        # AIS collector for Node.js 22+ (no npm deps)
+├── push_ais_to_github.js  # Push new ais_data/ files to GitHub via REST API
+├── bandar_abbas_daily.sh  # Daily Sentinel-1 + render workflow for Bandar Abbas
 ├── .env.example           # Credentials template
 ├── requirements.txt       # pip dependencies
 ├── README.md              # this file
@@ -116,10 +115,7 @@ python download_sar.py --days 7
 python visualisation.py --list
 python visualisation.py <ID>          # use the ID printed by --list
 
-# 5a. Quick look: stream AIS to your terminal in real time
-python ais2.py --bbox 54.5 25.0 57.5 27.5
-
-# 5b. Or run a long-running collector that writes hourly JSONL files
+# 5. In another terminal, start collecting AIS in parallel
 python ais_listener.py --bbox 54.5 25.0 57.5 27.5
 ```
 
@@ -267,7 +263,12 @@ python visualisation.py 163390df --prefer preview
 
 # Larger tiles = fewer files, more RAM
 python visualisation.py 163390df --max-dim 16000
+
+# Crop the rendered image to a geographic bounding box (lon/lat)
+python visualisation.py 163390df --crop-bbox 56.05 27.10 56.29 27.25
 ```
+
+The `--crop-bbox` flag uses the scene's geolocation grid (for SAFE products) or GeoTIFF spatial tags (for previews) to compute the exact pixel region that covers the requested area. For SAFE files the σ⁰ calibration LUT is still sampled at original-image coordinates so the result is radiometrically correct. If the crop bbox does not overlap the scene, the full image is rendered with a warning.
 
 ### Full flag reference
 
@@ -276,6 +277,9 @@ python visualisation.py 163390df --max-dim 16000
 | `--list` | List scenes in `data/` and exit. |
 | `--max-dim N` | Max pixel dimension per tile (default 8000). |
 | `--prefer {safe,preview}` | Source preference when both exist (default `safe`). |
+| `--bbox W S E N` | Reference area for `--full-coverage` filtering (default Hormuz). |
+| `--full-coverage` | Only render scenes whose footprint fully contains the bbox. |
+| `--crop-bbox W S E N` | Crop the output image to this geographic bbox (min_lon min_lat max_lon max_lat). |
 | `-v` / `--verbose` | DEBUG-level logging. |
 
 ### Memory usage
@@ -285,105 +289,6 @@ Peak RAM is roughly 1.5 GB per tile during processing, plus the full DN arrays h
 ### Why σ⁰ and not γ⁰?
 
 You can compute γ⁰ from σ⁰ by dividing by `cos(incidence_angle)`. For Sentinel-1 IW (θ ≈ 30°–46°), this is a 0.6–1.6 dB difference — visually identical after the dB stretch the script applies. The incidence angle is in the SAFE under `annotation/s1a-iw-grd-*.xml` if you ever need true γ⁰ for quantitative work.
-
----
-
-## AIS collection: two tools, pick what fits
-
-There are two ways to bring AIS into the pipeline, and which one you reach for depends on how much ceremony you want.
-
-| | `ais2.py` | `ais_listener.py` |
-|---|---|---|
-| Mental model | Watch the firehose | Run a daemon |
-| Output | stdout (text or JSONL) — pipe it, tee it, redirect it | Hourly JSONL files in `ais_data/YYYY-MM-DD/HH.jsonl` |
-| Sources | aisstream.io only | aisstream.io + NMEA-TCP + replay (extensible) |
-| Static-data enrichment | ✅ name, type, destination, dimensions inlined into every position | ❌ raw payloads only |
-| Per-vessel throttle | ✅ configurable (`--throttle SEC`) | ❌ writes every message in-bbox |
-| Reconnect on failure | ✅ | ✅ |
-| Best for | Interactive monitoring, quick captures, debugging, ad-hoc filtering with `jq` | Multi-day unattended collection, fusion with SAR scenes, multi-receiver setups |
-| Dependencies | `websockets`, `python-dotenv` | + `pyais` (if using NMEA-TCP) |
-
-If you don't know which to use, start with `ais2.py`. It's faster to understand, leaves no files behind unless you redirect, and gives you nicely enriched per-vessel records straight to your terminal. Move to `ais_listener.py` when you need durable archiving, multiple receivers, or you want the pipeline to survive your laptop closing.
-
----
-
-## `ais2.py` — minimal text streamer
-
-One source (aisstream.io), one output (stdout). Streams enriched AIS position records as they arrive, throttled to one line per vessel per N seconds so the terminal stays readable.
-
-**The trick that makes it useful:** it subscribes to both `PositionReport` and `ShipStaticData` and keeps a per-MMSI cache of static info in memory. The first time a ship's static data arrives, the cache is populated; every position from that ship afterward is emitted with name, type, destination, length, width, and draught attached. You get the enrichment of a tracking platform without running a database.
-
-### Output formats
-
-Human-readable (default):
-
-```
-16:08:09  MMSI 211223344  EXAMPLE TANKER        ( 26.0421,   55.5023)  sog= 12.3kn  cog= 87.0°  → DUBAI
-16:08:14  MMSI 538001122  ALSHAMS               ( 26.1108,   55.4901)  sog=  9.8kn  cog=265.0°  → JEBEL ALI
-```
-
-JSONL (`--jsonl`) — one record per line, ready for `jq` / pandas / DuckDB:
-
-```json
-{"mmsi": 211223344, "time_utc": "2026-05-24T16:08:09", "received_at": "2026-05-24T16:08:09+00:00", "lat": 26.0421, "lon": 55.5023, "sog": 12.3, "cog": 87.0, "heading": 88, "ship_name": "EXAMPLE TANKER", "ship_type": 80, "destination": "DUBAI", "draught": 11.5, "length": 200, "width": 32}
-```
-
-Logs (connection status, errors, reconnects) go to **stderr**, so stdout stays a clean data stream that survives pipes and redirects.
-
-### Usage
-
-```bash
-# Default Hormuz bbox, human-readable to terminal
-python ais2.py
-
-# Wider Persian Gulf + Gulf of Oman — much better coverage in practice
-python ais2.py --bbox 48.0 22.0 60.0 30.5
-
-# Capture to a JSONL file while still watching it live in the terminal
-python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl 2> stream.err | tee stream.jsonl
-
-# Same thing detached from the terminal (survives logout)
-nohup python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl 2> stream.err | tee stream.jsonl &
-disown
-
-# No throttle — every position aisstream sends (very chatty)
-python ais2.py --throttle 0
-
-# 5-minute throttle — quieter, still useful for slow-moving vessels
-python ais2.py --bbox 48.0 22.0 60.0 30.5 --throttle 300
-
-# Live filter to just Hormuz transit with jq while watching the whole Gulf
-python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl \
-    | jq -c 'select(.lon >= 54.5 and .lon <= 57.5 and .lat >= 25.0 and .lat <= 27.5)'
-
-# Also surface static-data updates (useful for catching new ships entering the AOI)
-python ais2.py --include-static
-```
-
-### Full flag reference
-
-| Flag | Description |
-|---|---|
-| `--bbox W S E N` | Four floats (lon/lat). Default: Hormuz `54.5 25.0 57.5 27.5`. |
-| `--throttle SEC` | Per-MMSI minimum interval between emitted positions (default 120). `0` = no throttle. |
-| `--jsonl` | Emit one JSON record per line instead of human-readable text. |
-| `--include-static` | Also print a line whenever ShipStaticData arrives. |
-| `-v` / `--verbose` | DEBUG-level logging on stderr. |
-
-### When traffic looks sparse
-
-The terrestrial network behind aisstream.io has uneven coverage. The **mid-strait Hormuz bbox** specifically tends to be quiet because there are few volunteer receivers with line-of-sight to the middle of the strait. If you see no records after a minute or two:
-
-```bash
-# Sanity-check the connection works at all
-python ais2.py --bbox -180 -90 180 90    # global firehose — instant traffic
-
-# Use a wider Gulf bbox instead — gives you coverage from Dubai, Bandar Abbas,
-# Muscat, Fujairah, Doha, Kuwait coastal receivers
-python ais2.py --bbox 48.0 22.0 60.0 30.5
-```
-
-The wider Gulf bbox is what works in practice for OSINT-style monitoring of Hormuz traffic — you see tankers approaching the strait from either side hours before they enter it, which is often more analytically interesting than the strait itself.
 
 ---
 
@@ -484,17 +389,41 @@ Subclass `Source`, implement `async def run(self, bbox, queue, stats)`, and call
 
 ---
 
+## `bandar_abbas_daily.sh` — Port of Bandar Abbas daily imagery
+
+A convenience wrapper that downloads the last N days of Sentinel-1 scenes that **fully cover the Port of Bandar Abbas** and renders each as a false-color crop of the port area.
+
+**Port of Bandar Abbas bbox:** `W=56.05  S=27.10  E=56.29  N=27.25`
+Covers Shahid Rajaee Container Port (west), the old fishing/commercial port (east), and the anchorage zone south of the breakwater.
+
+```bash
+# Default: last 7 days, preview-only (fast, no ~1 GB SAFE downloads)
+bash bandar_abbas_daily.sh
+
+# Last 14 days
+bash bandar_abbas_daily.sh --days 14
+
+# Also pull full SAFE products (~1 GB/scene, needed for native-res rendering)
+bash bandar_abbas_daily.sh --with-safe
+```
+
+The script:
+1. Sources `.env` for credentials
+2. Runs `download_sar.py --full-coverage` with the Bandar Abbas bbox
+3. Renders every scene found in `data/` with `visualisation.py --crop-bbox`
+4. Prints a summary of output files
+
+Requires `CDSE_USER`, `CDSE_PASSWORD`, `SH_CLIENT_ID`, and `SH_CLIENT_SECRET` in `.env`. Sentinel Hub previews (~30–100 MB, ~130 m/px) are downloaded by default. Full SAFE products (~1 GB each, ~10 m/px) require `--with-safe`.
+
+---
+
 ## Fusion workflow
 
 The whole point of the toolkit is correlating SAR detections with AIS positions.
 
 ```bash
 # Terminal 1: collect AIS continuously over the AOI
-# (Option A — long-running daemon writing hourly files for later analysis)
 python ais_listener.py --bbox 54.5 25.0 57.5 27.5
-
-# (Option B — lightweight, capture to one file while watching live)
-python ais2.py --bbox 48.0 22.0 60.0 30.5 --jsonl 2> stream.err | tee stream.jsonl
 
 # Terminal 2: every few days, pull new SAR scenes and render them
 python download_sar.py --days 7
@@ -502,7 +431,7 @@ python visualisation.py --list
 python visualisation.py <ID>
 ```
 
-For each rendered scene, look up the acquisition timestamp in `data/safe/<scene>.json` (`ContentDate.Start`) and pull AIS records from the matching JSONL — either `ais_data/YYYY-MM-DD/HH.jsonl` (from `ais_listener.py`) or your captured `stream.jsonl` (from `ais2.py`) — within ±5 minutes. Project AIS lat/lon onto the JPG using the tile manifest's pixel ranges, and:
+For each rendered scene, look up the acquisition timestamp in `data/safe/<scene>.json` (`ContentDate.Start`) and pull AIS records from the matching `ais_data/YYYY-MM-DD/HH.jsonl` files within ±5 minutes. Project AIS lat/lon onto the JPG using the tile manifest's pixel ranges, and:
 
 - **SAR detection with matching AIS** → identified ship (you can pull MMSI, name, type)
 - **SAR detection without matching AIS** → dark vessel, worth investigating
@@ -531,10 +460,10 @@ python-dotenv
 tqdm
 numpy
 tifffile
-imagecodecs        # ZSTD decode for Sentinel Hub TIFFs (visualisation.py)
+imagecodecs        # ZSTD decode for Sentinel Hub TIFFs
 Pillow
-websockets         # ais2.py and ais_listener.py
-pyais              # only for ais_listener.py with --sources nmea-tcp
+websockets
+pyais              # only needed if you use --sources nmea-tcp
 ```
 
 A `requirements.txt` is included.

@@ -186,6 +186,142 @@ def _bbox_fully_within(
     return all(_point_in_polygon(x, y, ring) for x, y in corners)
 
 
+# ---------------------------------------------------------------------------
+# Geolocation grid — used to map crop_bbox to pixel offsets in a SAFE scene
+# ---------------------------------------------------------------------------
+
+
+def _parse_geolocation_grid(
+    xml_bytes: bytes,
+) -> list[tuple[int, int, float, float]]:
+    """Return (line, pixel, lat, lon) tuples from a Sentinel-1 annotation XML.
+
+    Sentinel-1 GRDH annotation XMLs contain a sparse geolocation grid sampled
+    at roughly 10 km spacing.  We use this to find the pixel bounding box that
+    corresponds to a geographic crop region.
+    """
+    root = ET.fromstring(xml_bytes)
+    points: list[tuple[int, int, float, float]] = []
+    for pt in root.findall(".//geolocationGridPoint"):
+        points.append((
+            int(pt.find("line").text),
+            int(pt.find("pixel").text),
+            float(pt.find("latitude").text),
+            float(pt.find("longitude").text),
+        ))
+    return points
+
+
+def _pixel_bounds_from_geo(
+    geo_points: list[tuple[int, int, float, float]],
+    crop_bbox: tuple[float, float, float, float],
+    full_h: int,
+    full_w: int,
+) -> tuple[int, int, int, int]:
+    """Conservative pixel/line bounds for a geographic crop_bbox.
+
+    Returns (line_min, line_max, pix_min, pix_max).  Adds one GCP grid step of
+    margin on each side so edge pixels aren't clipped.  Clamps to the full
+    image extent.
+    """
+    minlon, minlat, maxlon, maxlat = crop_bbox
+
+    # Include GCPs a little outside the target bbox to bracket the boundary
+    margin_lat = max((maxlat - minlat) * 0.15, 0.05)
+    margin_lon = max((maxlon - minlon) * 0.15, 0.05)
+
+    near = [
+        (l, p)
+        for l, p, lat, lon in geo_points
+        if (minlat - margin_lat) <= lat <= (maxlat + margin_lat)
+        and (minlon - margin_lon) <= lon <= (maxlon + margin_lon)
+    ]
+    if not near:
+        raise ValueError(
+            f"No geolocation grid points near bbox {crop_bbox}. "
+            "The bbox may lie outside the scene footprint."
+        )
+
+    near_lines = sorted({l for l, _ in near})
+    near_pix   = sorted({p for _, p in near})
+
+    # One grid step as margin
+    all_lines = sorted({l for l, _, _, _ in geo_points})
+    all_pix   = sorted({p for _, p, _, _ in geo_points})
+    line_step = (all_lines[-1] - all_lines[0]) // max(len(all_lines) - 1, 1)
+    pix_step  = (all_pix[-1]   - all_pix[0])   // max(len(all_pix)   - 1, 1)
+
+    lmin = max(0,      near_lines[0]  - line_step)
+    lmax = min(full_h, near_lines[-1] + line_step)
+    pmin = max(0,      near_pix[0]    - pix_step)
+    pmax = min(full_w, near_pix[-1]   + pix_step)
+
+    if lmin >= lmax or pmin >= pmax:
+        raise ValueError(
+            f"Crop bbox produced an empty pixel region: "
+            f"lines {lmin}:{lmax}  pixels {pmin}:{pmax}."
+        )
+    return lmin, lmax, pmin, pmax
+
+
+# ---------------------------------------------------------------------------
+# GeoTIFF extent helpers — used to crop preview images by geographic bbox
+# ---------------------------------------------------------------------------
+
+
+def _geotiff_extent(tif_path: Path) -> tuple[float, float, float, float] | None:
+    """Geographic extent of a GeoTIFF as (minlon, minlat, maxlon, maxlat).
+
+    Reads ModelPixelScaleTag (33550) and ModelTiepointTag (33922) from the
+    TIFF tags — present in any Sentinel Hub output.  Returns None if absent.
+    """
+    import tifffile
+    with tifffile.TiffFile(str(tif_path)) as tf:
+        tags = tf.pages[0].tags
+        scale_tag = tags.get(33550)
+        tie_tag   = tags.get(33922)
+        h, w = tf.pages[0].shape[:2]
+
+    if scale_tag is None or tie_tag is None:
+        return None
+
+    sx = scale_tag.value[0]   # lon  per pixel (east)
+    sy = scale_tag.value[1]   # lat  per pixel (south, positive)
+    ox = tie_tag.value[3]     # longitude of upper-left corner
+    oy = tie_tag.value[4]     # latitude  of upper-left corner
+
+    return (ox, oy - sy * h, ox + sx * w, oy)  # (minlon, minlat, maxlon, maxlat)
+
+
+def _preview_crop_slice(
+    extent: tuple[float, float, float, float],
+    crop_bbox: tuple[float, float, float, float],
+    h: int,
+    w: int,
+) -> tuple[int, int, int, int]:
+    """Pixel slice (row0, row1, col0, col1) for crop_bbox inside a GeoTIFF.
+
+    extent and crop_bbox are both (minlon, minlat, maxlon, maxlat).
+    Row 0 corresponds to the northern (max lat) edge of the image.
+    """
+    minlon_e, minlat_e, maxlon_e, maxlat_e = extent
+    minlon_c, minlat_c, maxlon_c, maxlat_c = crop_bbox
+
+    sx = (maxlon_e - minlon_e) / w   # lon per pixel
+    sy = (maxlat_e - minlat_e) / h   # lat per pixel (row 0 = maxlat)
+
+    col0 = max(0, int((minlon_c - minlon_e) / sx))
+    col1 = min(w, math.ceil((maxlon_c - minlon_e) / sx))
+    row0 = max(0, int((maxlat_e - maxlat_c) / sy))
+    row1 = min(h, math.ceil((maxlat_e - minlat_c) / sy))
+
+    if col0 >= col1 or row0 >= row1:
+        raise ValueError(
+            f"Crop bbox {crop_bbox} does not overlap the GeoTIFF extent {extent}."
+        )
+    return row0, row1, col0, col1
+
+
 def filter_catalog(
     catalog: dict[str, dict],
     bbox: tuple[float, float, float, float],
@@ -256,7 +392,12 @@ def save_jpg(rgb: np.ndarray, path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def render_preview(tif_path: Path, out_dir: Path, scene_name: str) -> list[Path]:
+def render_preview(
+    tif_path: Path,
+    out_dir: Path,
+    scene_name: str,
+    crop_bbox: tuple[float, float, float, float] | None = None,
+) -> list[Path]:
     import tifffile
     log.info("Reading preview GeoTIFF: %s", tif_path.name)
     arr = tifffile.imread(str(tif_path))
@@ -269,6 +410,20 @@ def render_preview(tif_path: Path, out_dir: Path, scene_name: str) -> list[Path]
         arr = np.moveaxis(arr, 0, -1)
     if arr.shape[-1] < 2:
         raise ValueError(f"Need ≥2 bands (VV, VH); got {arr.shape}")
+
+    if crop_bbox is not None:
+        extent = _geotiff_extent(tif_path)
+        if extent is None:
+            log.warning("Preview GeoTIFF has no geotransform tags; skipping bbox crop.")
+        else:
+            h, w = arr.shape[:2]
+            try:
+                r0, r1, c0, c1 = _preview_crop_slice(extent, crop_bbox, h, w)
+                log.info("Cropping preview to bbox %s → rows %d:%d  cols %d:%d",
+                         crop_bbox, r0, r1, c0, c1)
+                arr = arr[r0:r1, c0:c1, :]
+            except ValueError as e:
+                log.warning("Preview crop failed: %s  Rendering full preview.", e)
 
     vv = arr[..., 0].astype(np.float32)
     vh = arr[..., 1].astype(np.float32)
@@ -435,11 +590,20 @@ def render_safe(
     out_dir: Path,
     scene_name: str,
     max_dim: int = DEFAULT_MAX_DIM,
+    crop_bbox: tuple[float, float, float, float] | None = None,
 ) -> list[Path]:
-    """Render a SAFE at native resolution, tiling so every tile ≤ max_dim px."""
+    """Render a SAFE at native resolution, tiling so every tile ≤ max_dim px.
+
+    When crop_bbox (minlon, minlat, maxlon, maxlat) is supplied the geolocation
+    grid in the annotation XML is used to find the pixel/line range that covers
+    the geographic area.  Only that crop is rendered.  The calibration LUT is
+    still sampled at the original full-image coordinates so σ0 is correct.
+    """
     import tifffile
 
     log.info("Opening SAFE archive: %s", safe_zip.name)
+    crop_y_off = crop_x_off = 0  # pixel offsets into the full image for LUT calibration
+
     with zipfile.ZipFile(safe_zip) as z:
         members = z.namelist()
 
@@ -466,9 +630,42 @@ def render_safe(
         cal_vv = parse_calibration_lut(z.read(vv_cal))
         cal_vh = parse_calibration_lut(z.read(vh_cal))
 
+        # Geographic crop — locate the annotation XML with the geolocation grid
+        if crop_bbox is not None:
+            ann_vv = next(
+                (m for m in members
+                 if m.endswith(".xml")
+                 and "/annotation/s1" in m
+                 and "/calibration/" not in m
+                 and "-vv-" in m),
+                None,
+            )
+            if ann_vv is None:
+                log.warning("No annotation XML found in SAFE; skipping bbox crop.")
+            else:
+                try:
+                    geo_points = _parse_geolocation_grid(z.read(ann_vv))
+                    full_h, full_w = vv_dn_full.shape
+                    lmin, lmax, pmin, pmax = _pixel_bounds_from_geo(
+                        geo_points, crop_bbox, full_h, full_w
+                    )
+                    log.info(
+                        "Cropping SAFE to bbox %s → lines %d:%d  pixels %d:%d  (%d×%d px)",
+                        crop_bbox, lmin, lmax, pmin, pmax,
+                        pmax - pmin, lmax - lmin,
+                    )
+                    vv_dn_full = vv_dn_full[lmin:lmax, pmin:pmax]
+                    vh_dn_full = vh_dn_full[lmin:lmax, pmin:pmax]
+                    crop_y_off, crop_x_off = lmin, pmin
+                except ValueError as e:
+                    log.warning("SAFE bbox crop failed: %s  Rendering full scene.", e)
+
     h, w = vv_dn_full.shape
-    log.info("Full image: %d × %d  (%.0f MP)  — native resolution",
-             w, h, h * w / 1e6)
+    log.info(
+        "Working image: %d × %d  (%.0f MP)%s",
+        w, h, h * w / 1e6,
+        "  (cropped)" if (crop_y_off or crop_x_off) else "  — native resolution",
+    )
 
     tiles = tile_layout(h, w, max_dim)
     n_rows = tiles[-1][0] + 1
@@ -494,8 +691,13 @@ def render_safe(
         vv_dn_tile = vv_dn_full[y0:y1, x0:x1]
         vh_dn_tile = vh_dn_full[y0:y1, x0:x1]
 
-        vv_sigma0 = compute_sigma0(vv_dn_tile, *cal_vv, y_offset=y0, x_offset=x0)
-        vh_sigma0 = compute_sigma0(vh_dn_tile, *cal_vh, y_offset=y0, x_offset=x0)
+        # LUT coords must be in the full-image reference frame
+        vv_sigma0 = compute_sigma0(
+            vv_dn_tile, *cal_vv, y_offset=y0 + crop_y_off, x_offset=x0 + crop_x_off
+        )
+        vh_sigma0 = compute_sigma0(
+            vh_dn_tile, *cal_vh, y_offset=y0 + crop_y_off, x_offset=x0 + crop_x_off
+        )
 
         rgb = false_color(vv_sigma0, vh_sigma0)
 
@@ -559,6 +761,12 @@ def parse_args(argv=None):
         help="Only consider scenes whose footprint fully contains the bbox "
              "(uses GeoFootprint from sidecar JSON written by download_sar.py).",
     )
+    p.add_argument(
+        "--crop-bbox", nargs=4, type=float,
+        metavar=("W", "S", "E", "N"),
+        help="Crop the rendered image to this geographic bbox (min_lon min_lat max_lon max_lat). "
+             "Uses the geolocation grid (SAFE) or GeoTIFF tags (preview) to compute pixel bounds.",
+    )
     p.add_argument("-v", "--verbose", action="store_true",
                    help="DEBUG-level logging.")
     return p.parse_args(argv)
@@ -616,16 +824,20 @@ def main(argv=None) -> int:
         log.error("No usable file for scene %s", sid)
         return 1
 
+    crop_bbox = tuple(args.crop_bbox) if args.crop_bbox else None
+    if crop_bbox:
+        log.info("Crop bbox: %s", crop_bbox)
+
     if source == "safe":
         src: Path = info["safe"]
         out_dir = src.parent
         log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
-        written = render_safe(src, out_dir, name, max_dim=args.max_dim)
+        written = render_safe(src, out_dir, name, max_dim=args.max_dim, crop_bbox=crop_bbox)
     else:
         src = info["preview"]
         out_dir = src.parent
         log.info("Source: preview GeoTIFF")
-        written = render_preview(src, out_dir, name)
+        written = render_preview(src, out_dir, name, crop_bbox=crop_bbox)
 
     log.info("─" * 60)
     log.info("✓ Wrote %d file(s):", len(written))
