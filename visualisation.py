@@ -36,7 +36,8 @@ Usage:
 Outputs are written next to the source file (data/safe/ or data/previews/).
 
 Requirements:
-    pip install numpy tifffile imagecodecs Pillow
+    pip install numpy tifffile imagecodecs Pillow piexif
+    (piexif is optional — EXIF metadata is silently skipped if not installed)
 """
 
 from __future__ import annotations
@@ -324,6 +325,78 @@ def _preview_crop_slice(
     return row0, row1, col0, col1
 
 
+# ---------------------------------------------------------------------------
+# EXIF helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_scene_datetime(scene_name: str) -> str | None:
+    """EXIF DateTimeOriginal string from a Sentinel-1 scene name, or None."""
+    m = re.search(r"(\d{8}T\d{6})", scene_name)
+    if not m:
+        return None
+    dt = m.group(1)  # e.g. "20240101T025502"
+    return f"{dt[:4]}:{dt[4:6]}:{dt[6:8]} {dt[9:11]}:{dt[11:13]}:{dt[13:15]}"
+
+
+def _geo_at_pixel(
+    geo_points: list[tuple[int, int, float, float]],
+    line: float,
+    pixel: float,
+) -> tuple[float, float]:
+    """Bilinear interpolation of (lat, lon) from the sparse geolocation grid."""
+    lines_u  = np.array(sorted({p[0] for p in geo_points}), dtype=np.float64)
+    pixels_u = np.array(sorted({p[1] for p in geo_points}), dtype=np.float64)
+    lut = {(p[0], p[1]): (p[2], p[3]) for p in geo_points}
+
+    li = int(np.clip(np.searchsorted(lines_u,  line)  - 1, 0, len(lines_u)  - 2))
+    pi = int(np.clip(np.searchsorted(pixels_u, pixel) - 1, 0, len(pixels_u) - 2))
+
+    l0, l1 = int(lines_u[li]), int(lines_u[li + 1])
+    p0, p1 = int(pixels_u[pi]), int(pixels_u[pi + 1])
+    lw = (line - l0) / max(l1 - l0, 1.0)
+    pw = (pixel - p0) / max(p1 - p0, 1.0)
+
+    lat00, lon00 = lut.get((l0, p0), (0.0, 0.0))
+    lat01, lon01 = lut.get((l0, p1), (0.0, 0.0))
+    lat10, lon10 = lut.get((l1, p0), (0.0, 0.0))
+    lat11, lon11 = lut.get((l1, p1), (0.0, 0.0))
+
+    lat = lat00*(1-lw)*(1-pw) + lat01*(1-lw)*pw + lat10*lw*(1-pw) + lat11*lw*pw
+    lon = lon00*(1-lw)*(1-pw) + lon01*(1-lw)*pw + lon10*lw*(1-pw) + lon11*lw*pw
+    return float(lat), float(lon)
+
+
+def _make_exif(dt_str: str | None, lat: float | None, lon: float | None) -> bytes | None:
+    """Build EXIF bytes with DateTimeOriginal + GPS tags. Returns None if piexif absent."""
+    try:
+        import piexif
+    except ImportError:
+        return None
+
+    def _dms(val: float):
+        val = abs(val)
+        d = int(val)
+        m = int((val - d) * 60)
+        s = round((val - d - m / 60) * 3600, 4)
+        return ((d, 1), (m, 1), (int(s * 10000), 10000))
+
+    exif_ifd: dict = {}
+    if dt_str:
+        exif_ifd[piexif.ExifIFD.DateTimeOriginal] = dt_str.encode()
+
+    gps_ifd: dict = {}
+    if lat is not None and lon is not None:
+        gps_ifd[piexif.GPSIFD.GPSLatitudeRef]  = b"N" if lat >= 0 else b"S"
+        gps_ifd[piexif.GPSIFD.GPSLatitude]     = _dms(lat)
+        gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
+        gps_ifd[piexif.GPSIFD.GPSLongitude]    = _dms(lon)
+
+    if not exif_ifd and not gps_ifd:
+        return None
+    return piexif.dump({"Exif": exif_ifd, "GPS": gps_ifd})
+
+
 def filter_catalog(
     catalog: dict[str, dict],
     bbox: tuple[float, float, float, float],
@@ -384,9 +457,12 @@ def false_color(vv: np.ndarray, vh: np.ndarray) -> np.ndarray:
     return (rgb * 255.0).astype(np.uint8)
 
 
-def save_jpg(rgb: np.ndarray, path: Path) -> None:
+def save_jpg(rgb: np.ndarray, path: Path, exif: bytes | None = None) -> None:
     from PIL import Image
-    Image.fromarray(rgb).save(path, "JPEG", quality=92, optimize=True)
+    kwargs: dict = {"quality": 92, "optimize": True}
+    if exif:
+        kwargs["exif"] = exif
+    Image.fromarray(rgb).save(path, "JPEG", **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -413,8 +489,12 @@ def render_preview(
     if arr.shape[-1] < 2:
         raise ValueError(f"Need ≥2 bands (VV, VH); got {arr.shape}")
 
+    extent = _geotiff_extent(tif_path)
+    ul_lat = ul_lon = None
+    if extent is not None:
+        ul_lon, ul_lat = extent[0], extent[3]  # minlon, maxlat = upper-left corner
+
     if crop_bbox is not None:
-        extent = _geotiff_extent(tif_path)
         if extent is None:
             log.warning("Preview GeoTIFF has no geotransform tags; skipping bbox crop.")
         else:
@@ -424,6 +504,11 @@ def render_preview(
                 log.info("Cropping preview to bbox %s → rows %d:%d  cols %d:%d",
                          crop_bbox, r0, r1, c0, c1)
                 arr = arr[r0:r1, c0:c1, :]
+                # Update UL to reflect the crop's upper-left corner
+                sx = (extent[2] - extent[0]) / w
+                sy = (extent[3] - extent[1]) / h
+                ul_lon = extent[0] + c0 * sx
+                ul_lat = extent[3] - r0 * sy
             except ValueError as e:
                 log.warning("Preview crop failed: %s  Rendering full preview.", e)
 
@@ -434,7 +519,8 @@ def render_preview(
     rgb = false_color(vv, vh)
     out_path = out_dir / f"{scene_name}_falsecolor.jpg"
     log.info("Writing JPG: %s", out_path)
-    save_jpg(rgb, out_path)
+    exif = _make_exif(_parse_scene_datetime(scene_name), ul_lat, ul_lon)
+    save_jpg(rgb, out_path, exif=exif)
     return [out_path]
 
 
@@ -605,6 +691,7 @@ def render_safe(
 
     log.info("Opening SAFE archive: %s", safe_zip.name)
     crop_y_off = crop_x_off = 0  # pixel offsets into the full image for LUT calibration
+    geo_points: list[tuple[int, int, float, float]] | None = None
 
     with zipfile.ZipFile(safe_zip) as z:
         members = z.namelist()
@@ -632,21 +719,27 @@ def render_safe(
         cal_vv = parse_calibration_lut(z.read(vv_cal))
         cal_vh = parse_calibration_lut(z.read(vh_cal))
 
-        # Geographic crop — locate the annotation XML with the geolocation grid
+        # Annotation XML: always parse for geolocation grid (crop + EXIF GPS)
+        ann_vv = next(
+            (m for m in members
+             if m.endswith(".xml")
+             and "/annotation/s1" in m
+             and "/calibration/" not in m
+             and "-vv-" in m),
+            None,
+        )
+        if ann_vv is not None:
+            try:
+                geo_points = _parse_geolocation_grid(z.read(ann_vv))
+            except Exception as e:
+                log.warning("Failed to parse geolocation grid: %s", e)
+
+        # Geographic crop
         if crop_bbox is not None:
-            ann_vv = next(
-                (m for m in members
-                 if m.endswith(".xml")
-                 and "/annotation/s1" in m
-                 and "/calibration/" not in m
-                 and "-vv-" in m),
-                None,
-            )
-            if ann_vv is None:
+            if geo_points is None:
                 log.warning("No annotation XML found in SAFE; skipping bbox crop.")
             else:
                 try:
-                    geo_points = _parse_geolocation_grid(z.read(ann_vv))
                     full_h, full_w = vv_dn_full.shape
                     lmin, lmax, pmin, pmax = _pixel_bounds_from_geo(
                         geo_points, crop_bbox, full_h, full_w
@@ -714,7 +807,16 @@ def render_safe(
             )
 
         path = out_dir / name
-        save_jpg(rgb, path)
+        ul_lat = ul_lon = None
+        if geo_points is not None:
+            try:
+                ul_lat, ul_lon = _geo_at_pixel(
+                    geo_points, y0 + crop_y_off, x0 + crop_x_off
+                )
+            except Exception:
+                pass
+        exif = _make_exif(_parse_scene_datetime(scene_name), ul_lat, ul_lon)
+        save_jpg(rgb, path, exif=exif)
         log.debug("    → %s  (%.1f MB)", path.name, path.stat().st_size / 1e6)
         written.append(path)
 
