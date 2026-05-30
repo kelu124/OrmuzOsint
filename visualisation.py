@@ -66,6 +66,7 @@ log = logging.getLogger("visualisation")
 DATA_DIR = Path("data")
 SAFE_DIR = DATA_DIR / "safe"
 PREVIEW_DIR = DATA_DIR / "previews"
+RENDERS_DIR = DATA_DIR / "renders"  # output-only: preview renders go here, not in previews/
 
 DEFAULT_MAX_DIM = 8000  # max pixel dim per tile when rendering from SAFE
 
@@ -367,8 +368,16 @@ def _geo_at_pixel(
     return float(lat), float(lon)
 
 
-def _make_exif(dt_str: str | None, lat: float | None, lon: float | None) -> bytes | None:
-    """Build EXIF bytes with DateTimeOriginal + GPS tags. Returns None if piexif absent."""
+def _make_exif(
+    dt_str: str | None,
+    lat: float | None,
+    lon: float | None,
+    scene_name: str | None = None,
+) -> bytes | None:
+    """Build EXIF bytes with image metadata, DateTimeOriginal, and GPS tags.
+
+    Returns None if piexif is not installed (silently skipped).
+    """
     try:
         import piexif
     except ImportError:
@@ -381,6 +390,13 @@ def _make_exif(dt_str: str | None, lat: float | None, lon: float | None) -> byte
         s = round((val - d - m / 60) * 3600, 4)
         return ((d, 1), (m, 1), (int(s * 10000), 10000))
 
+    ifd0: dict = {piexif.ImageIFD.Software: b"OrmuzOsint"}
+    if scene_name:
+        ifd0[piexif.ImageIFD.ImageDescription] = scene_name.encode()
+        sat = re.match(r"S1([A-Z])", scene_name)
+        if sat:
+            ifd0[piexif.ImageIFD.Make] = f"Sentinel-1{sat.group(1)}".encode()
+
     exif_ifd: dict = {}
     if dt_str:
         exif_ifd[piexif.ExifIFD.DateTimeOriginal] = dt_str.encode()
@@ -391,10 +407,9 @@ def _make_exif(dt_str: str | None, lat: float | None, lon: float | None) -> byte
         gps_ifd[piexif.GPSIFD.GPSLatitude]     = _dms(lat)
         gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
         gps_ifd[piexif.GPSIFD.GPSLongitude]    = _dms(lon)
+        gps_ifd[piexif.GPSIFD.GPSMapDatum]     = b"WGS-84"
 
-    if not exif_ifd and not gps_ifd:
-        return None
-    return piexif.dump({"Exif": exif_ifd, "GPS": gps_ifd})
+    return piexif.dump({"0th": ifd0, "Exif": exif_ifd, "GPS": gps_ifd})
 
 
 def filter_catalog(
@@ -477,6 +492,7 @@ def render_preview(
     crop_bbox: tuple[float, float, float, float] | None = None,
 ) -> list[Path]:
     import tifffile
+    out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Reading preview GeoTIFF: %s", tif_path.name)
     arr = tifffile.imread(str(tif_path))
     log.debug("raw shape: %s  dtype: %s", arr.shape, arr.dtype)
@@ -815,7 +831,7 @@ def render_safe(
                 )
             except Exception:
                 pass
-        exif = _make_exif(_parse_scene_datetime(scene_name), ul_lat, ul_lon)
+        exif = _make_exif(_parse_scene_datetime(scene_name), ul_lat, ul_lon, scene_name=scene_name)
         save_jpg(rgb, path, exif=exif)
         log.debug("    → %s  (%.1f MB)", path.name, path.stat().st_size / 1e6)
         written.append(path)
@@ -1024,7 +1040,9 @@ def _render_scene(
         raise FileNotFoundError(f"No usable file found for scene '{name}'.")
 
     src: Path = info[source]
-    out_dir = src.parent
+    # SAFE renders go next to the zip; preview renders go to a dedicated output-only
+    # directory so that source files in data/previews/ are never treated as tile markers.
+    out_dir = src.parent if source == "safe" else RENDERS_DIR
 
     # Idempotency: if any falsecolor JPG already exists for this scene, skip entirely.
     existing = sorted(out_dir.glob(f"{name}_falsecolor*.jpg"))
