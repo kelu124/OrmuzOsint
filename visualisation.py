@@ -903,109 +903,9 @@ def trim_measurement_folder(safe_zip: Path) -> None:
 
 
 def _is_safe_trimmed(safe_zip: Path) -> bool:
-    """Return True if the zip contains no measurement/ entries."""
+    """Return True if the zip contains no measurement/ entries (= fully processed)."""
     with zipfile.ZipFile(safe_zip) as z:
         return not any("/measurement/" in m for m in z.namelist())
-
-
-def _redownload_safe(safe_zip: Path) -> None:
-    """Re-download a full SAFE product, overwriting the existing (trimmed) zip.
-
-    Reads the product UUID from the companion sidecar JSON written by
-    download_sar.py, authenticates with the CDSE OAuth endpoint using
-    CDSE_USER / CDSE_PASSWORD, then streams the ~1 GB product to disk.
-
-    Credentials are read from environment variables.  If they are not set,
-    the .env file in the script directory (or CWD) is parsed first.
-    """
-    import requests
-
-    # Load .env if credentials not already in environment
-    def _load_dotenv() -> None:
-        for candidate in (Path(__file__).parent / ".env", Path(".env")):
-            if candidate.exists():
-                for line in candidate.read_text().splitlines():
-                    m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)=(.*)", line)
-                    if m and m.group(1) not in os.environ:
-                        os.environ[m.group(1)] = m.group(2).strip()
-                break
-
-    _load_dotenv()
-
-    user = os.environ.get("CDSE_USER", "")
-    pw   = os.environ.get("CDSE_PASSWORD", "")
-    if not user or not pw:
-        raise RuntimeError(
-            "CDSE_USER / CDSE_PASSWORD not set. "
-            "Add them to .env or export them before running."
-        )
-
-    # Product UUID from sidecar JSON (written by download_sar.py)
-    sidecar = safe_zip.with_suffix(".json")   # S1A_...SAFE.json
-    if not sidecar.exists():
-        raise FileNotFoundError(
-            f"Sidecar {sidecar.name} not found — cannot determine the CDSE "
-            "product ID needed for re-download.  Run download_sar.py to "
-            "regenerate it."
-        )
-    meta = json.loads(sidecar.read_text())
-    pid  = meta.get("Id")
-    if not pid:
-        raise ValueError(f"No 'Id' field in sidecar {sidecar.name}.")
-
-    # Authenticate
-    token_url = (
-        "https://identity.dataspace.copernicus.eu/auth/realms/CDSE"
-        "/protocol/openid-connect/token"
-    )
-    log.info("Authenticating with CDSE…")
-    r = requests.post(
-        token_url,
-        data={"client_id": "cdse-public", "grant_type": "password",
-              "username": user, "password": pw},
-        timeout=30,
-    )
-    r.raise_for_status()
-    token = r.json()["access_token"]
-
-    # Stream download to a .partial temp file, then rename
-    download_url = (
-        f"https://download.dataspace.copernicus.eu"
-        f"/odata/v1/Products({pid})/$value"
-    )
-    log.info("Re-downloading %s (product %s)…", safe_zip.name, pid)
-    tmp = safe_zip.with_suffix(".zip.partial")
-    try:
-        with requests.get(
-            download_url,
-            headers={"Authorization": f"Bearer {token}"},
-            stream=True,
-            timeout=(30, 600),
-        ) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            downloaded = 0
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=256 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total and downloaded % (50 * 1024 * 1024) < 256 * 1024:
-                            log.info(
-                                "  %.0f / %.0f MB  (%.0f%%)",
-                                downloaded / 1e6, total / 1e6,
-                                100 * downloaded / total,
-                            )
-        tmp.rename(safe_zip)
-    except Exception:
-        if tmp.exists():
-            tmp.unlink()
-        raise
-
-    log.info(
-        "Re-download complete: %s (%.0f MB)",
-        safe_zip.name, safe_zip.stat().st_size / 1e6,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1051,13 +951,13 @@ def _render_scene(
         return []
 
     if source == "safe":
-        log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
         if _is_safe_trimmed(src):
-            log.warning(
-                "SAFE zip has been trimmed (measurement/ removed). "
-                "Attempting automatic re-download…"
+            log.info(
+                "Already processed (zip trimmed, measurement/ absent) — skipping: %s",
+                src.name,
             )
-            _redownload_safe(src)
+            return []
+        log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
         written = render_safe(src, out_dir, name, max_dim=args.max_dim, crop_bbox=crop_bbox)
         if args.trim_safe:
             trim_measurement_folder(src)
@@ -1110,8 +1010,8 @@ def parse_args(argv=None):
         help="After rendering, remove measurement/ entries (raw GRD TIFFs) "
              "from the SAFE zip to reclaim ~1 GB of disk space. "
              "Annotation, calibration, and manifest files are preserved. "
-             "If a trimmed zip is later rendered again, the script re-downloads "
-             "the full product automatically.",
+             "A trimmed zip is treated as fully processed — subsequent runs "
+             "skip it entirely rather than attempting a re-download.",
     )
     p.add_argument(
         "--all", action="store_true",
