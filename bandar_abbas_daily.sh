@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # bandar_abbas_daily.sh — Daily Sentinel-1 imagery for Port of Bandar Abbas.
 #
-# For each of the last N days (default 7), downloads the first scene whose
-# footprint fully covers the Bandar Abbas port bbox, then renders a
-# false-color crop of that geographic area using visualisation.py.
+# For each of the last N days (default 7), downloads all scenes that intersect
+# the Bandar Abbas port bbox, then renders a false-color crop of that geographic
+# area using visualisation.py.
 #
 # Bandar Abbas bbox (Shahid Rajaee + old port + anchorage):
 #   W=56.12176  S=26.94227  E=56.55762  N=27.24841
@@ -75,7 +75,6 @@ SAFE_FLAG=""
 if python3 download_sar.py \
     --days  "${DAYS}" \
     --bbox  "${BBOX_W}" "${BBOX_S}" "${BBOX_E}" "${BBOX_N}" \
-    --full-coverage \
     ${SAFE_FLAG}; then
   echo "Download step complete."
 else
