@@ -66,6 +66,7 @@ log = logging.getLogger("visualisation")
 DATA_DIR = Path("data")
 SAFE_DIR = DATA_DIR / "safe"
 PREVIEW_DIR = DATA_DIR / "previews"
+RENDERS_DIR = DATA_DIR / "renders"  # output-only: preview renders go here, not in previews/
 
 DEFAULT_MAX_DIM = 8000  # max pixel dim per tile when rendering from SAFE
 
@@ -491,6 +492,7 @@ def render_preview(
     crop_bbox: tuple[float, float, float, float] | None = None,
 ) -> list[Path]:
     import tifffile
+    out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Reading preview GeoTIFF: %s", tif_path.name)
     arr = tifffile.imread(str(tif_path))
     log.debug("raw shape: %s  dtype: %s", arr.shape, arr.dtype)
@@ -1038,7 +1040,9 @@ def _render_scene(
         raise FileNotFoundError(f"No usable file found for scene '{name}'.")
 
     src: Path = info[source]
-    out_dir = src.parent
+    # SAFE renders go next to the zip; preview renders go to a dedicated output-only
+    # directory so that source files in data/previews/ are never treated as tile markers.
+    out_dir = src.parent if source == "safe" else RENDERS_DIR
 
     # Idempotency: if any falsecolor JPG already exists for this scene, skip entirely.
     existing = sorted(out_dir.glob(f"{name}_falsecolor*.jpg"))
