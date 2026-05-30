@@ -66,7 +66,6 @@ log = logging.getLogger("visualisation")
 DATA_DIR = Path("data")
 SAFE_DIR = DATA_DIR / "safe"
 PREVIEW_DIR = DATA_DIR / "previews"
-RENDERS_DIR = DATA_DIR / "renders"  # output-only: preview renders go here, not in previews/
 
 DEFAULT_MAX_DIM = 8000  # max pixel dim per tile when rendering from SAFE
 
@@ -492,7 +491,6 @@ def render_preview(
     crop_bbox: tuple[float, float, float, float] | None = None,
 ) -> list[Path]:
     import tifffile
-    out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Reading preview GeoTIFF: %s", tif_path.name)
     arr = tifffile.imread(str(tif_path))
     log.debug("raw shape: %s  dtype: %s", arr.shape, arr.dtype)
@@ -939,32 +937,30 @@ def _render_scene(
     else:
         raise FileNotFoundError(f"No usable file found for scene '{name}'.")
 
-    src: Path = info[source]
-    # SAFE renders go next to the zip; preview renders go to a dedicated output-only
-    # directory so that source files in data/previews/ are never treated as tile markers.
-    out_dir = src.parent if source == "safe" else RENDERS_DIR
+    if source != "safe":
+        log.info("No SAFE zip for scene '%s' — skipping (preview-only scenes are not rendered).", name)
+        return []
 
-    # Idempotency: only rc-tile files (_r{row}c{col}_…) count as completion markers;
-    # single-tile outputs and stray JPGs are ignored.
+    src: Path = info["safe"]
+    out_dir = src.parent
+
+    if _is_safe_trimmed(src):
+        log.info(
+            "Already processed (zip trimmed, measurement/ absent) — skipping: %s",
+            src.name,
+        )
+        return []
+
+    # Idempotency: only rc-tile files (_r{row}c{col}_…) count as completion markers.
     existing = sorted(out_dir.glob(f"{name}_falsecolor_r*c*.jpg"))
     if existing:
         log.info("Tiles already present (%d file(s)) — skipping.", len(existing))
         return []
 
-    if source == "safe":
-        if _is_safe_trimmed(src):
-            log.info(
-                "Already processed (zip trimmed, measurement/ absent) — skipping: %s",
-                src.name,
-            )
-            return []
-        log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
-        written = render_safe(src, out_dir, name, max_dim=args.max_dim, crop_bbox=crop_bbox)
-        if args.trim_safe:
-            trim_measurement_folder(src)
-    else:
-        log.info("Source: preview GeoTIFF")
-        written = render_preview(src, out_dir, name, crop_bbox=crop_bbox)
+    log.info("Source: SAFE (native resolution, tiles ≤ %d px)", args.max_dim)
+    written = render_safe(src, out_dir, name, max_dim=args.max_dim, crop_bbox=crop_bbox)
+    if args.trim_safe:
+        trim_measurement_folder(src)
 
     return written
 
