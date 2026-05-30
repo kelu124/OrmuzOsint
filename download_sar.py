@@ -359,7 +359,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    date_group = p.add_mutually_exclusive_group(required=True)
+    date_group = p.add_mutually_exclusive_group(required=False)
     date_group.add_argument(
         "--start",
         type=lambda s: datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc),
@@ -405,10 +405,82 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Just list matching scenes; download nothing.",
     )
     p.add_argument(
+        "--convert-previews", action="store_true",
+        help="Convert all .tif files in data/previews/ to false-color JPGs, "
+             "skipping any that already have a .jpg. Can be combined with a "
+             "download (--days / --start) or run standalone.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true",
         help="Verbose logging (DEBUG).",
     )
     return p.parse_args(argv)
+
+
+def convert_previews_to_jpg(
+    preview_dir: Path,
+    quality: int = 92,
+) -> tuple[int, int]:
+    """Convert all .tif previews in preview_dir to false-color JPGs.
+
+    Each preview is a 3-band FLOAT32 GeoTIFF (VV, VH, VV/VH σ⁰) written by
+    download_preview().  The same false-color recipe used in visualisation.py
+    is applied: R=VV, G=VH, B=VH/VV, each stretched from dB to 0–255.
+
+    Returns (converted, skipped) where skipped means a .jpg already existed.
+    """
+    import numpy as np
+    import tifffile
+    from PIL import Image
+
+    tifs = sorted(preview_dir.glob("*.tif"))
+    if not tifs:
+        log.info("No .tif files found in %s", preview_dir)
+        return 0, 0
+
+    converted = skipped = 0
+    for tif_path in tifs:
+        jpg_path = tif_path.with_suffix(".jpg")
+        if jpg_path.exists():
+            log.debug("Skip (already exists): %s", jpg_path.name)
+            skipped += 1
+            continue
+
+        log.info("Converting %s → %s", tif_path.name, jpg_path.name)
+        try:
+            arr = tifffile.imread(str(tif_path))
+            # tifffile may return (bands, H, W) for PlanarConfig=2 — flip to (H, W, bands)
+            if arr.ndim == 3 and arr.shape[0] in (2, 3, 4) \
+                    and arr.shape[0] < min(arr.shape[1], arr.shape[2]):
+                arr = np.moveaxis(arr, 0, -1)
+            if arr.ndim != 3 or arr.shape[-1] < 2:
+                log.warning("Unexpected shape %s for %s — skipping.", arr.shape, tif_path.name)
+                continue
+
+            vv = arr[..., 0].astype(np.float32)
+            vh = arr[..., 1].astype(np.float32)
+            ratio = vh / np.maximum(vv, 1e-7)
+
+            def _stretch(power: np.ndarray, lo_db: float, hi_db: float) -> np.ndarray:
+                db = 10.0 * np.log10(np.maximum(power, 1e-7))
+                return np.clip((db - lo_db) / (hi_db - lo_db), 0.0, 1.0)
+
+            rgb = np.stack([
+                _stretch(vv,    -25.0,  0.0),   # R = VV
+                _stretch(vh,    -30.0, -5.0),   # G = VH
+                _stretch(ratio, -10.0,  5.0),   # B = VH/VV
+            ], axis=-1)
+            Image.fromarray((rgb * 255.0).astype(np.uint8)).save(
+                jpg_path, "JPEG", quality=quality, optimize=True
+            )
+            log.info("  → %s (%.1f MB)", jpg_path.name, jpg_path.stat().st_size / 1e6)
+            converted += 1
+        except Exception as e:
+            log.error("Failed to convert %s: %s", tif_path.name, e)
+
+    log.info("convert_previews_to_jpg: %d converted, %d skipped (already existed).",
+             converted, skipped)
+    return converted, skipped
 
 
 def human_size(n: int | None) -> str:
@@ -436,8 +508,14 @@ def main(argv: list[str] | None = None) -> int:
     sh_id = os.getenv("SH_CLIENT_ID")
     sh_secret = os.getenv("SH_CLIENT_SECRET")
 
-    need_safe = not args.no_safe and not args.list_only
-    need_preview = not args.no_preview and not args.list_only
+    need_download = args.days is not None or args.start is not None
+    if not need_download and not args.convert_previews:
+        log.error("Provide --days or --start to download, "
+                  "or --convert-previews to convert existing previews.")
+        return 2
+
+    need_safe = need_download and not args.no_safe and not args.list_only
+    need_preview = need_download and not args.no_preview and not args.list_only
 
     if need_safe and not (cdse_user and cdse_pass):
         log.error("CDSE_USER / CDSE_PASSWORD missing from .env "
@@ -447,6 +525,12 @@ def main(argv: list[str] | None = None) -> int:
         log.error("SH_CLIENT_ID / SH_CLIENT_SECRET missing from .env "
                   "(required for Sentinel Hub previews).")
         return 2
+
+    # Standalone --convert-previews (no date range supplied)
+    if not need_download:
+        args.data_dir.mkdir(parents=True, exist_ok=True)
+        convert_previews_to_jpg(args.data_dir / "previews")
+        return 0
 
     # Resolve date window
     end = args.end or datetime.now(tz=timezone.utc)
@@ -593,8 +677,11 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("  failures (%d):", len(failures))
         for f in failures:
             log.warning("    - %s", f)
-        return 1
-    return 0
+
+    if args.convert_previews:
+        convert_previews_to_jpg(preview_dir)
+
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
