@@ -319,11 +319,25 @@ def download_preview(
         "Accept": "image/tiff",
     }
 
-    r = requests.post(SH_PROCESS_URL, json=body, headers=headers, timeout=300)
-    if r.status_code >= 400:
-        log.error("Sentinel Hub Process API error %s: %s",
-                  r.status_code, r.text[:500])
-        r.raise_for_status()
+    backoff = 60
+    while True:
+        r = requests.post(SH_PROCESS_URL, json=body, headers=headers, timeout=300)
+        if r.status_code == 429:
+            log.warning(
+                "Sentinel Hub returned 429 RATE_LIMIT_EXCEEDED — "
+                "Let's wait a bit (%ds)…", backoff,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 3600)
+            # Refresh token before retrying (it may have expired during a long wait)
+            token = sh_client_credentials_token(sh_client_id, sh_client_secret)
+            headers["Authorization"] = f"Bearer {token}"
+            continue
+        if r.status_code >= 400:
+            log.error("Sentinel Hub Process API error %s: %s",
+                      r.status_code, r.text[:500])
+            r.raise_for_status()
+        break
 
     tmp = dest.with_suffix(".tif.partial")
     with open(tmp, "wb") as f:
