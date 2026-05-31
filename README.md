@@ -201,6 +201,12 @@ python download_sar.py --days 14 --no-safe
 
 A Sentinel-1 IW swath is ~250 km wide and each scene covers ~150–250 km along-track. The default Hormuz bbox (~300×280 km) is larger than a single scene along-track, so `--full-coverage` against the default bbox will frequently return zero results. The script warns when the filter empties the set. For a "fully covered" workflow, shrink the bbox to ~150 km on the longest axis or rely on multiple intersecting scenes mosaiced downstream.
 
+### Rate limits and 429 errors
+
+The **Sentinel Hub Process API** (used for clipped preview GeoTIFFs) enforces a free-tier quota. If you exceed it — typically from rendering many large bboxes in quick succession — the API returns HTTP 429. The script logs the error and raises an exception; the partial `.tif.partial` file is discarded. Wait a few minutes and re-run; already-downloaded previews are skipped (cached on disk).
+
+The **CDSE OData catalog** and SAFE download endpoints are more generous, but can return 429 under heavy load. If this happens, add a short `sleep` between calls or reduce `--days` to narrow the window.
+
 ### Expected scene count
 
 With Sentinel-1A + Sentinel-1C operating, Hormuz sees a Sentinel-1 pass roughly every 3 days when averaging ascending and descending orbits. About half are dual-pol VV+VH. Expect 3–8 matching scenes per 14-day window.
@@ -281,28 +287,54 @@ The `--crop-bbox` flag uses the scene's geolocation grid (for SAFE products) or 
 | Flag | Description |
 |---|---|
 | `--list` | List scenes in `data/` and exit. |
+| `--list-jpgs` | List all JPGs in `data/safe/`, explain the filename structure, and print EXIF metadata (datetime, GPS, Make, Software, GPSMapDatum) for each file. Then exit. |
+| `--all` | Render every scene found in `data/` in one call. Continues past per-scene errors and prints a batch summary. Combines with all other flags. |
 | `--max-dim N` | Max pixel dimension per tile (default 8000). |
 | `--prefer {safe,preview}` | Source preference when both exist (default `safe`). |
 | `--bbox W S E N` | Reference area for `--full-coverage` filtering (default Hormuz). |
 | `--full-coverage` | Only render scenes whose footprint fully contains the bbox. |
-| `--all` | Render every scene found in `data/` in one call. Continues past per-scene errors and prints a batch summary. Combines with all other flags. |
 | `--crop-bbox W S E N` | Crop the output image to this geographic bbox (min_lon min_lat max_lon max_lat). |
-| `--trim-safe` | After rendering, delete `measurement/` entries (raw GRD TIFFs) from the SAFE zip to reclaim ~1 GB. Annotation, calibration, and manifest files are kept. See recovery note below. |
+| `--trim-safe` | After rendering, delete `measurement/` entries (raw GRD TIFFs) from the SAFE zip to reclaim ~1 GB. The trimmed zip becomes a permanent done marker — the scene is never re-rendered or re-downloaded. |
 | `-v` / `--verbose` | DEBUG-level logging. |
 
-### Disk-space management and recovery
+### Disk-space management (`--trim-safe`)
 
 `--trim-safe` rewrites the SAFE zip in-place, keeping only annotation, calibration, manifest, and support files (~5–20 MB) and discarding the raw GRD measurement TIFFs (~900 MB–1 GB). The operation is atomic: a `.trimming` temp file is written first, then renamed over the original. If writing fails the original is untouched.
 
-**Automatic recovery:** if you later ask `visualisation.py` to render (or re-render) a scene whose zip has already been trimmed, the script detects the missing `measurement/` folder, fetches a fresh full SAFE from CDSE using `CDSE_USER` / `CDSE_PASSWORD` from `.env`, and then renders normally. The re-download overwrites the trimmed zip. If credentials are absent or the download fails, a clear error is logged and the script exits with code 1.
+**A trimmed zip is the permanent done marker.** On any subsequent run, `visualisation.py` detects the absent `measurement/` folder and skips the scene entirely with an "already processed" log line. Tiles are never regenerated from a trimmed zip — if you need to re-render (different crop, different tile size), re-download the full SAFE first with `download_sar.py`.
 
 ```bash
-# Render + free 1 GB afterwards
+# Render + free ~1 GB per scene afterwards
 python visualisation.py <ID> --trim-safe
 
-# Later, re-render (auto-downloads if the zip was trimmed)
-python visualisation.py <ID> --crop-bbox 56.12176 26.94227 56.55762 27.24841
+# Render all, crop to Bandar Abbas bbox, then trim each zip
+python visualisation.py --all --crop-bbox 56.12176 26.94227 56.55762 27.24841 --trim-safe
 ```
+
+### Idempotency
+
+The rendering pipeline is safe to run multiple times:
+
+- **Trimmed zip** — scene is skipped immediately ("already processed").
+- **Tile files present** — if `*_falsecolor_r*c*.jpg` tiles already exist next to the zip, the scene is skipped even if the zip was not yet trimmed.
+- **No zip at all** — if a scene has no local SAFE zip but has a sidecar JSON (written by `download_sar.py` alongside a preview), `visualisation.py` will attempt to download the SAFE zip from CDSE before rendering.
+
+### EXIF metadata in output JPGs
+
+Every rendered JPG is tagged with structured EXIF metadata using `piexif` (install separately: `pip install piexif`):
+
+| EXIF field | Value |
+|---|---|
+| `ImageDescription` | Full Sentinel-1 scene name |
+| `Make` | `Sentinel-1A` / `Sentinel-1C` (from scene name) |
+| `Software` | `OrmuzOsint` |
+| `DateTimeOriginal` | Scene acquisition UTC time |
+| `GPSLatitude` / `GPSLongitude` | UL-corner coordinates of the tile (WGS-84) |
+| `GPSMapDatum` | `WGS-84` |
+
+For multi-tile scenes each tile carries the correct GPS coordinates for its own upper-left corner, computed by bilinear interpolation over the scene's geolocation grid.
+
+Use `--list-jpgs` to read and display all EXIF fields for every JPG in `data/safe/`.
 
 ### Memory usage
 
@@ -413,13 +445,13 @@ Subclass `Source`, implement `async def run(self, bbox, queue, stats)`, and call
 
 ## `bandar_abbas_daily.sh` — Port of Bandar Abbas daily imagery
 
-A convenience wrapper that downloads the last N days of Sentinel-1 scenes that **fully cover the Port of Bandar Abbas** and renders each as a false-color crop of the port area.
+A convenience wrapper that downloads the last N days of Sentinel-1 scenes that **intersect the Port of Bandar Abbas** and renders each as a false-color crop of the port area.
 
 **Port of Bandar Abbas bbox:** `W=56.12176  S=26.94227  E=56.55762  N=27.24841`
 Covers Shahid Rajaee Container Port (west), the old fishing/commercial port (east), and the anchorage zone south of the breakwater.
 
 ```bash
-# Default: last 7 days, preview-only (fast, no ~1 GB SAFE downloads)
+# Default: last 7 days
 bash bandar_abbas_daily.sh
 
 # Last 14 days
@@ -431,13 +463,13 @@ bash bandar_abbas_daily.sh --with-safe
 
 The script:
 1. Sources `.env` for credentials
-2. Runs `download_sar.py --full-coverage` with the Bandar Abbas bbox
-3. Renders every scene found in `data/` with `visualisation.py --crop-bbox --trim-safe`
-4. Prints a summary of output files
+2. Runs `download_sar.py` with the Bandar Abbas bbox (scenes that intersect the bbox)
+3. Renders every scene found in `data/` with `visualisation.py --all --crop-bbox --trim-safe`
+4. Prints a summary of output JPG files
 
-`--trim-safe` is applied by default: after tiling each SAFE product the raw measurement TIFFs (~1 GB) are removed, keeping the zip at ~10–20 MB. If a zip was trimmed by a previous run and tiles need to be regenerated, `visualisation.py` automatically re-downloads the full product before rendering.
+`--trim-safe` is applied by default: after tiling each SAFE product the raw measurement TIFFs (~1 GB) are removed, keeping the zip at ~10–20 MB. A trimmed zip is the **permanent done marker** — the scene will not be re-rendered or re-downloaded on subsequent runs.
 
-Requires `CDSE_USER`, `CDSE_PASSWORD`, `SH_CLIENT_ID`, and `SH_CLIENT_SECRET` in `.env`. Sentinel Hub previews (~30–100 MB, ~130 m/px) are downloaded by default. Full SAFE products (~1 GB each, ~10 m/px) require `--with-safe`.
+Requires `CDSE_USER`, `CDSE_PASSWORD`, `SH_CLIENT_ID`, and `SH_CLIENT_SECRET` in `.env`. Full SAFE products (~1 GB each, ~10 m/px) require `--with-safe`.
 
 ---
 
