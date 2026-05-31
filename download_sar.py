@@ -319,17 +319,31 @@ def download_preview(
         "Accept": "image/tiff",
     }
 
-    backoff = 60
+    # Sentinel Hub rate limiting: https://docs.sentinel-hub.com/api/latest/api/overview/rate-limiting/
+    # On 429, the Retry-After header gives the wait in *milliseconds*.
+    # We honour it when present; otherwise we use exponential backoff from 60s.
+    MAX_RETRIES = 5
+    backoff = 60.0  # seconds, used when Retry-After is absent
+    attempt = 0
     while True:
         r = requests.post(SH_PROCESS_URL, json=body, headers=headers, timeout=300)
         if r.status_code == 429:
+            attempt += 1
+            retry_after_ms = r.headers.get("Retry-After")
+            if retry_after_ms is not None:
+                wait = float(retry_after_ms) / 1000.0
+            else:
+                wait = backoff
+                backoff = min(backoff * 2, 3600.0)
             log.warning(
-                "Sentinel Hub returned 429 RATE_LIMIT_EXCEEDED — "
-                "Let's wait a bit (%ds)…", backoff,
+                "Rate limit hit — waiting %.0fs before retry (attempt %d/%d)",
+                wait, attempt, MAX_RETRIES,
             )
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 3600)
-            # Refresh token before retrying (it may have expired during a long wait)
+            if attempt >= MAX_RETRIES:
+                log.error("Sentinel Hub rate limit: %d retries exhausted. Giving up.", MAX_RETRIES)
+                r.raise_for_status()
+            time.sleep(wait)
+            # Refresh token — it may expire during a long wait
             token = sh_client_credentials_token(sh_client_id, sh_client_secret)
             headers["Authorization"] = f"Bearer {token}"
             continue
